@@ -1,0 +1,132 @@
+.main-card {
+  max-width: 800px;
+  margin: 20px auto;
+  padding: 20px;
+}
+
+.transcription-container {
+  max-height: 400px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  margin-top: 20px;
+  background: #fafafa;
+  padding: 10px;
+  will-change: scroll-position;
+  transform: translateZ(0);
+  scroll-behavior: smooth;
+}
+
+.bloque {
+  margin-bottom: 15px;
+  padding: 12px;
+  border-radius: 4px;
+  background: #f8f9fa;
+  border-left: 4px solid #007bff;
+  transition: all 0.3s ease;
+}
+
+/* Definitive blocks styling */
+.definitivo {
+  background: #e8f5e8;
+  border-left-color: #28a745;
+}
+
+/* Language-specific colors for definitive blocks */
+.definitivo[data-lang="en"] {
+  background: #e3f2fd;
+  border-left-color: #2196f3;
+}
+
+.definitivo[data-lang="es"] {
+  background: #fff3e0;
+  border-left-color: #ff9800;
+}
+
+/* Temporal/partial block */
+.temporal {
+  background: #fff3cd;
+  border-left-color: orange;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+.temporal.no-pulse {
+  animation: none;
+}
+
+/* Language-specific colors for temporal blocks */
+.temporal[data-lang="en"] {
+  background: #e1f5fe;
+  border-left-color: #03a9f4;
+}
+
+.temporal[data-lang="es"] {
+  background: #fff8e1;
+  border-left-color: #ffc107;
+}
+
+.lang {
+  font-weight: bold;
+  color: #666;
+  margin: 0 0 5px 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.05);
+}
+
+/* Language badges */
+.lang[data-lang="en"] {
+  background: #2196f3;
+  color: white;
+}
+
+.lang[data-lang="es"] {
+  background: #ff9800;
+  color: white;
+}
+
+.text {
+  margin: 0 0 5px 0;
+  font-size: 16px;
+  line-height: 1.5;
+  color: #333;
+}
+
+.timestamp, .status {
+  color: #999;
+  font-size: 12px;
+}
+
+.loading {
+  text-align: center;
+  color: #666;
+  padding: 20px;
+  font-style: italic;
+}
+
+.empty {
+  text-align: center;
+  color: #999;
+  padding: 40px;
+  font-size: 1.1em;
+}
+
+button {
+  margin-right: 10px;
+  margin-bottom: 10px;
+}
+
+@keyframes pulse {
+  0%, 100% { 
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% { 
+    opacity: 0.85;
+    transform: scale(0.995);
+  }
+}

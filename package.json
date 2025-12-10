@@ -22,13 +22,17 @@
   },
   "private": true,
   "dependencies": {
+    "@angular/cdk": "^20.2.14",
     "@angular/common": "^20.3.0",
     "@angular/compiler": "^20.3.0",
     "@angular/core": "^20.3.0",
     "@angular/forms": "^20.3.0",
+    "@angular/material": "^20.2.14",
     "@angular/platform-browser": "^20.3.0",
     "@angular/router": "^20.3.0",
+    "assemblyai": "^4.19.0",
     "rxjs": "~7.8.0",
+    "socket.io-client": "^4.8.1",
     "tslib": "^2.3.0",
     "zone.js": "~0.15.0"
   },

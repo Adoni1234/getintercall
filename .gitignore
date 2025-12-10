@@ -1,17 +1,27 @@
-# See https://docs.github.com/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
-
-# Compiled output
+# =========================================
+# Angular / Node
+# =========================================
 /dist
 /tmp
 /out-tsc
 /bazel-out
-
-# Node
 /node_modules
-npm-debug.log
-yarn-error.log
 
-# IDEs and editors
+# Angular cache
+/.angular/cache
+
+# =========================================
+# Logs
+# =========================================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.log
+
+# =========================================
+# IDEs y Editores
+# =========================================
 .idea/
 .project
 .classpath
@@ -26,18 +36,45 @@ yarn-error.log
 !.vscode/tasks.json
 !.vscode/launch.json
 !.vscode/extensions.json
-.history/*
 
-# Miscellaneous
-/.angular/cache
-.sass-cache/
-/connect.lock
-/coverage
-/libpeerconnection.log
-testem.log
-/typings
-__screenshots__/
+.history/
 
-# System files
+# =========================================
+# OS / Sistema
+# =========================================
 .DS_Store
 Thumbs.db
+
+# =========================================
+# Testing
+# =========================================
+/coverage
+/coverage/*
+/libpeerconnection.log
+testem.log
+/.nyc_output
+
+# =========================================
+# Types / Build Helpers
+# =========================================
+/typings
+
+# Screenshots generados por tests
+__screenshots__/
+
+# =========================================
+# Env files (MUY IMPORTANTE)
+# =========================================
+# Si usas variables de entorno locales
+.env
+*.env
+*.local
+
+# =========================================
+# Temporary / Cache
+# =========================================
+.sass-cache/
+.connect.lock
+temp/
+.tmp/
+.cache/
