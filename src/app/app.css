@@ -4,6 +4,22 @@
   padding: 20px;
 }
 
+.block-counter {
+  font-weight: 600;
+  color: #666;
+}
+
+.button-group {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 15px;
+  flex-wrap: wrap;
+}
+
+.button-group button {
+  margin: 0;
+}
+
 .transcription-container {
   max-height: 400px;
   overflow-y: auto;
@@ -115,9 +131,9 @@
   font-size: 1.1em;
 }
 
-button {
-  margin-right: 10px;
-  margin-bottom: 10px;
+mat-progress-spinner {
+  margin: 20px auto;
+  display: block;
 }
 
 @keyframes pulse {

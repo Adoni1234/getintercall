@@ -43,7 +43,7 @@ export class App implements AfterViewChecked {
   private lastPartialTime = 0;
   private silenceTimeout = 1500; // 1.5s sin partials → finalizar bloque
   private previousTranscriptionLength = 0;
-   autoScrollEnabled = true;
+  autoScrollEnabled = true;
 
   constructor() {
     this.socket = io('http://localhost:3000');
@@ -240,7 +240,26 @@ export class App implements AfterViewChecked {
     this.isRecording = false;
     this.loading = false;
     this.stopSilenceTimer();
-    this.snackBar.open('🛑 Transcripción detenida.', 'OK');
+    
+    // Clear all transcription data on stop
+    this.clearTranscription();
+    
+    this.snackBar.open('🛑 Transcripción detenida y limpiada.', 'OK', { duration: 2000 });
+  }
+
+  clearTranscription() {
+    const wasEmpty = this.bloques.length === 0 && !this.currentPartial.text.trim();
+    
+    this.transcription = '';
+    this.bloques = [];
+    this.currentPartial = { text: '', lang: '' };
+    this.previousTranscriptionLength = 0;
+    this.cdr.detectChanges();
+    
+    if (!wasEmpty) {
+      console.log('🧹 Transcription cleared');
+      this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
+    }
   }
 
   ngAfterViewChecked(): void {

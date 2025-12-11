@@ -1,16 +1,24 @@
 <mat-card class="main-card">
   <mat-card-header>
     <mat-card-title>GetIntercall - Transcripción Real-Time</mat-card-title>
-    <mat-card-subtitle>Detección automática de inglés y español</mat-card-subtitle>
+    <mat-card-subtitle>
+      Detección automática de inglés y español
+      <span *ngIf="bloques.length > 0" class="block-counter"> • {{bloques.length}} bloque{{bloques.length !== 1 ? 's' : ''}}</span>
+    </mat-card-subtitle>
   </mat-card-header>
 
   <mat-card-content>
-    <button mat-raised-button color="primary" (click)="startRecording()" [disabled]="isRecording">
-      🎙️ Iniciar Transcripción
-    </button>
-    <button mat-raised-button color="warn" (click)="stopRecording()" [disabled]="!isRecording">
-      🛑 Detener
-    </button>
+    <div class="button-group">
+      <button mat-raised-button color="primary" (click)="startRecording()" [disabled]="isRecording">
+        🎙️ Iniciar
+      </button>
+      <button mat-raised-button color="warn" (click)="stopRecording()" [disabled]="!isRecording">
+        🛑 Detener
+      </button>
+      <button mat-raised-button color="accent" (click)="clearTranscription()" [disabled]="!isRecording || bloques.length === 0">
+        🧹 Limpiar
+      </button>
+    </div>
 
     <mat-progress-spinner *ngIf="loading" mode="indeterminate" diameter="50"></mat-progress-spinner>
 
@@ -39,11 +47,14 @@
       </div>
       
       <!-- Empty states -->
-      <div *ngIf="loading && bloques.length === 0" class="loading">
+      <div *ngIf="loading && bloques.length === 0 && !currentPartial.text" class="loading">
         🎧 Escuchando audio de pestaña...
       </div>
-      <div *ngIf="!isRecording && bloques.length === 0" class="empty">
-        Presiona "Iniciar Transcripción" para comenzar
+      <div *ngIf="isRecording && bloques.length === 0 && !currentPartial.text && !loading" class="empty">
+        Esperando audio para transcribir...
+      </div>
+      <div *ngIf="!isRecording && bloques.length === 0 && !currentPartial.text" class="empty">
+        Presiona "🎙️ Iniciar" para comenzar la transcripción
       </div>
     </div>
   </mat-card-content>
