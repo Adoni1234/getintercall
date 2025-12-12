@@ -1,61 +1,124 @@
-<mat-card class="main-card">
-  <mat-card-header>
-    <mat-card-title>GetIntercall - Transcripción Real-Time</mat-card-title>
-    <mat-card-subtitle>
-      Detección automática de inglés y español
-      <span *ngIf="bloques.length > 0" class="block-counter"> • {{bloques.length}} bloque{{bloques.length !== 1 ? 's' : ''}}</span>
-    </mat-card-subtitle>
-  </mat-card-header>
-
-  <mat-card-content>
-    <div class="button-group">
-      <button mat-raised-button color="primary" (click)="startRecording()" [disabled]="isRecording">
-        🎙️ Iniciar
-      </button>
-      <button mat-raised-button color="warn" (click)="stopRecording()" [disabled]="!isRecording">
-        🛑 Detener
-      </button>
-      <button mat-raised-button color="accent" (click)="clearTranscription()" [disabled]="!isRecording || bloques.length === 0">
-        🧹 Limpiar
+<div class="app-container">
+  <!-- Translation Panel (Left Side) -->
+  <div class="translation-panel" [class.collapsed]="!showTranslationPanel">
+    <div class="panel-header">
+      <h3>🌐 Traducciones</h3>
+      <button mat-icon-button (click)="toggleTranslationPanel()" class="toggle-btn">
+        {{ showTranslationPanel ? '◀' : '▶' }}
       </button>
     </div>
-
-    <mat-progress-spinner *ngIf="loading" mode="indeterminate" diameter="50"></mat-progress-spinner>
-
-    <div class="transcription-container" #scrollMe (scroll)="onContainerScroll($event)">
-      <!-- Definitive blocks -->
-      <div *ngFor="let bloque of bloques; let i = index" 
-           class="bloque definitivo" 
-           [attr.data-lang]="bloque.lang">
-        <p class="lang" [attr.data-lang]="bloque.lang">
-          {{ bloque.lang === 'es' ? '🇪🇸 Español' : '🇺🇸 English' }}
-        </p>
-        <p class="text">{{ bloque.text }}</p>
-        <small class="timestamp">Bloque {{ i + 1 }}</small>
+    
+    <div class="panel-content" *ngIf="showTranslationPanel">
+      <div *ngIf="translations.length === 0" class="empty-translations">
+        Selecciona texto para traducir
       </div>
       
-      <!-- Current partial block -->
-      <div *ngIf="currentPartial.text.trim()" 
-           class="bloque temporal" 
-           [attr.data-lang]="currentPartial.lang"
-           [ngClass]="{ 'no-pulse': !autoScrollEnabled }">
-        <p class="lang" [attr.data-lang]="currentPartial.lang">
-          {{ currentPartial.lang === 'es' ? '🇪🇸 Español' : '🇺🇸 English' }} - Escuchando...
-        </p>
-        <p class="text">{{ currentPartial.text }}</p>
-        <small class="status">● En vivo</small>
+      <div *ngFor="let translation of translations; let i = index" class="translation-item">
+        <div class="translation-header">
+          <span class="translation-number">#{{ translations.length - i }}</span>
+          <button mat-icon-button (click)="removeTranslation(i)" class="delete-btn">
+            🗑️
+          </button>
+        </div>
+        
+        <div class="translation-content">
+          <div class="original">
+            <span class="label">{{ translation.sourceLang === 'es' ? '🇪🇸' : '🇺🇸' }} Original:</span>
+            <p>{{ translation.original }}</p>
+          </div>
+          
+          <div class="arrow">↓</div>
+          
+          <div class="translated">
+            <span class="label">{{ translation.targetLang === 'es' ? '🇪🇸' : '🇺🇸' }} Traducción:</span>
+            <p *ngIf="!translation.translating && translation.translated">{{ translation.translated }}</p>
+            <div *ngIf="translation.translating" class="translating">
+              <mat-spinner diameter="20"></mat-spinner>
+              <span>Traduciendo...</span>
+            </div>
+            <div *ngIf="!translation.translating && !translation.translated" class="error-message">
+              <span>⚠️ Error al traducir</span>
+              <button mat-button color="primary" (click)="translateItem(translation)" class="retry-btn">
+                🔄 Reintentar
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
       
-      <!-- Empty states -->
-      <div *ngIf="loading && bloques.length === 0 && !currentPartial.text" class="loading">
-        🎧 Escuchando audio de pestaña...
-      </div>
-      <div *ngIf="isRecording && bloques.length === 0 && !currentPartial.text && !loading" class="empty">
-        Esperando audio para transcribir...
-      </div>
-      <div *ngIf="!isRecording && bloques.length === 0 && !currentPartial.text" class="empty">
-        Presiona "🎙️ Iniciar" para comenzar la transcripción
-      </div>
+      <button 
+        mat-raised-button 
+        color="warn" 
+        class="clear-all-btn"
+        *ngIf="translations.length > 0"
+        (click)="clearAllTranslations()">
+        🧹 Limpiar Todo
+      </button>
     </div>
-  </mat-card-content>
-</mat-card>
+  </div>
+
+  <!-- Main Content (Right Side) -->
+  <div class="main-content">
+    <mat-card class="main-card">
+      <mat-card-header>
+        <mat-card-title>GetIntercall - Transcripción Real-Time</mat-card-title>
+        <mat-card-subtitle>
+          Detección automática de inglés y español
+          <span *ngIf="bloques.length > 0" class="block-counter"> • {{bloques.length}} bloque{{bloques.length !== 1 ? 's' : ''}}</span>
+        </mat-card-subtitle>
+      </mat-card-header>
+
+      <mat-card-content>
+        <div class="button-group">
+          <button mat-raised-button color="primary" (click)="startRecording()" [disabled]="isRecording">
+            🎙️ Iniciar
+          </button>
+          <button mat-raised-button color="warn" (click)="stopRecording()" [disabled]="!isRecording">
+            🛑 Detener
+          </button>
+          <button mat-raised-button color="accent" (click)="clearTranscription()" [disabled]="!isRecording || bloques.length === 0">
+            🧹 Limpiar
+          </button>
+        </div>
+
+        <mat-progress-spinner *ngIf="loading" mode="indeterminate" diameter="50"></mat-progress-spinner>
+
+        <div class="transcription-container" #scrollMe (scroll)="onContainerScroll($event)" (mouseup)="onTextSelection()">
+          <!-- Definitive blocks -->
+          <div *ngFor="let bloque of bloques; let i = index" 
+               class="bloque definitivo" 
+               [attr.data-lang]="bloque.lang">
+            <p class="lang" [attr.data-lang]="bloque.lang">
+              {{ bloque.lang === 'es' ? '🇪🇸 Español' : '🇺🇸 English' }}
+            </p>
+            <p class="text" [attr.data-lang]="bloque.lang">{{ bloque.text }}</p>
+            <small class="timestamp">Bloque {{ i + 1 }}</small>
+          </div>
+          
+          <!-- Current partial block -->
+          <div *ngIf="currentPartial.text.trim()" 
+               class="bloque temporal" 
+               [attr.data-lang]="currentPartial.lang"
+               [ngClass]="{ 'no-pulse': !autoScrollEnabled }">
+            <p class="lang" [attr.data-lang]="currentPartial.lang">
+              {{ currentPartial.lang === 'es' ? '🇪🇸 Español' : '🇺🇸 English' }} - Escuchando...
+            </p>
+            <p class="text">{{ currentPartial.text }}</p>
+            <small class="status">● En vivo</small>
+          </div>
+          
+          <!-- Empty states -->
+          <div *ngIf="loading && bloques.length === 0 && !currentPartial.text" class="loading">
+            🎧 Escuchando audio de pestaña...
+          </div>
+          <div *ngIf="isRecording && bloques.length === 0 && !currentPartial.text && !loading" class="empty">
+            Esperando audio para transcribir...
+          </div>
+          <div *ngIf="!isRecording && bloques.length === 0 && !currentPartial.text" class="empty">
+            Presiona "🎙️ Iniciar" para comenzar la transcripción
+          </div>
+        </div>
+      </mat-card-content>
+    </mat-card>
+  </div>
+</div>
