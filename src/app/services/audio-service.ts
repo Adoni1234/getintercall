@@ -8,6 +8,7 @@ export class AudioService {
   private audioContext: AudioContext | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private gainNode: GainNode | null = null;
+  private compressor: DynamicsCompressorNode | null = null;
   private processor: AudioWorkletNode | null = null;
   private isRecording = false;
   private chunkSubject = new Subject<Blob>();
@@ -18,13 +19,31 @@ export class AudioService {
   private pcmBuffer = new Int16Array(800);
   private bufferIndex = 0;
 
+  // 🔥 Pre-buffer configuration
+  private preBuffer: Int16Array[] = [];
+  private maxPreBufferChunks = 20; // 20 chunks x 50ms = 1000ms
+  private minPreBufferChunks = 0; // ← DESACTIVAR warm-up, enviar TODO desde inicio
+  private isSendingAudio = true; // ← INICIAR en modo "enviando" para no perder nada
+  private lastVoiceTime = 0;
+  private silenceThreshold = 2000; // ← AUMENTADO a 2.0s para no cortar entre palabras
+  private chunksReceived = 0;
+
   async startTabAudioCapture() {
     console.log('Abriendo selector de pestaña...');
     let stream: MediaStream;
     try {
       stream = await navigator.mediaDevices.getDisplayMedia({
         video: true,
-        audio: true,
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          // @ts-ignore
+          googEchoCancellation: false,
+          googAutoGainControl: false,
+          googNoiseSuppression: false,
+          googHighpassFilter: false,
+        } as any,
       });
       console.log('Stream capturado: Screen share con audio');
       stream.getVideoTracks().forEach(track => track.enabled = false);
@@ -36,14 +55,22 @@ export class AudioService {
     if (stream.getAudioTracks().length === 0) {
       throw new Error('Stream sin audio tracks');
     }
-    console.log('Stream capturado: Tiene audio', stream.getAudioTracks().length > 0);
 
     this.audioContext = new AudioContext({ sampleRate: 16000 });
     this.source = this.audioContext.createMediaStreamSource(stream);
+    
     this.gainNode = this.audioContext.createGain();
-    this.gainNode.gain.value = 10; // x10 boost for low vol tab audio
+    this.gainNode.gain.value = 50;
+    
+    this.compressor = this.audioContext.createDynamicsCompressor();
+    this.compressor.threshold.value = -50;
+    this.compressor.knee.value = 40;
+    this.compressor.ratio.value = 12;
+    this.compressor.attack.value = 0.003;
+    this.compressor.release.value = 0.25;
 
-    // Worklet for PCM16
+    console.log('🔊 Audio boost: Gain x50 + Compresor + Pre-buffer continuo 1000ms (1s)');
+
     await this.audioContext.audioWorklet.addModule(URL.createObjectURL(new Blob([`
       class PCMProcessor extends AudioWorkletProcessor {
         constructor() {
@@ -60,7 +87,8 @@ export class AudioService {
             const inputData = input[0];
             const pcm16 = new Int16Array(inputData.length);
             for (let i = 0; i < inputData.length; i++) {
-              pcm16[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+              let sample = inputData[i] * 32768;
+              pcm16[i] = Math.max(-32768, Math.min(32767, sample));
             }
             this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
             return true;
@@ -72,19 +100,61 @@ export class AudioService {
     `], { type: 'application/javascript' })));
 
     this.processor = new AudioWorkletNode(this.audioContext, 'pcm-processor');
+    
     this.source.connect(this.gainNode);
-    this.gainNode.connect(this.processor);
+    this.gainNode.connect(this.compressor);
+    this.compressor.connect(this.processor);
+
+    // 🔥 Reset estado al iniciar - EMPEZAR ENVIANDO TODO
+    this.preBuffer = [];
+    this.isSendingAudio = true; // ← Enviar desde el inicio
+    this.lastVoiceTime = Date.now(); // ← Timestamp de inicio
+    this.chunksReceived = 0;
 
     this.processor.port.onmessage = (e) => {
       if (e.data instanceof ArrayBuffer) {
         const pcmData = new Int16Array(e.data);
+        
         for (let i = 0; i < pcmData.length; i++) {
           this.pcmBuffer[this.bufferIndex++] = pcmData[i];
+          
           if (this.bufferIndex >= this.pcmBuffer.length) {
-            const chunk = new ArrayBuffer(this.pcmBuffer.length * 2);
-            new Int16Array(chunk).set(this.pcmBuffer);
-            console.log('Chunk recibido para real-time: PCM16 50ms', chunk.byteLength, 'bytes');
-            this.chunkSubject.next(new Blob([chunk], { type: 'audio/pcm' }));
+            const chunk = new Int16Array(this.pcmBuffer.length);
+            chunk.set(this.pcmBuffer);
+            
+            // 🔥 INCREMENTAR contador
+            this.chunksReceived++;
+            
+            // Calcular nivel de audio
+            const avgLevel = this.calculateAudioLevel(chunk);
+            
+            // 🔥 SIMPLIFICADO: Enviar TODO el audio siempre, sin detección compleja
+            const hasVoice = avgLevel > -50; // Umbral MÁS bajo para captar todo
+            const now = Date.now();
+            
+            // 🔥 ESTRATEGIA NUEVA: Enviar TODO el audio, solo pausar después de silencio largo
+            if (hasVoice) {
+              this.lastVoiceTime = now;
+            }
+            
+            const timeSinceLastVoice = now - this.lastVoiceTime;
+            
+            // 🔥 Enviar audio SIEMPRE (incluso silencio) durante los primeros 2 segundos después de voz
+            if (timeSinceLastVoice < this.silenceThreshold) {
+              const currentBuffer = new ArrayBuffer(chunk.length * 2);
+              new Int16Array(currentBuffer).set(chunk);
+              this.chunkSubject.next(new Blob([currentBuffer], { type: 'audio/pcm' }));
+              
+              if (this.chunksReceived % 20 === 0) {
+                console.log(`🎤 Enviando: nivel ${avgLevel.toFixed(1)}dB, silencio: ${timeSinceLastVoice}ms`);
+              }
+            } else {
+              // Silencio muy largo, dejar de enviar
+              if (this.chunksReceived % 20 === 0) {
+                console.log(`🔇 Pausa larga: ${timeSinceLastVoice}ms sin voz`);
+              }
+            }
+            
             this.bufferIndex = 0;
           }
         }
@@ -92,7 +162,18 @@ export class AudioService {
     };
 
     this.isRecording = true;
-    console.log('Grabación real-time iniciada con PCM16 50ms chunks (gain x10)');
+    console.log('✅ Grabación iniciada: Modo pre-buffer continuo activo');
+  }
+
+  private calculateAudioLevel(buffer: Int16Array): number {
+    let sum = 0;
+    for (let i = 0; i < buffer.length; i++) {
+      sum += Math.abs(buffer[i]);
+    }
+    const avg = sum / buffer.length;
+    const normalized = avg / 32768;
+    const db = 20 * Math.log10(normalized + 0.0001);
+    return db;
   }
 
   stopRecording() {
@@ -106,6 +187,9 @@ export class AudioService {
       this.audioContext.close();
     }
     this.isRecording = false;
+    this.preBuffer = [];
+    this.isSendingAudio = true;
+    this.chunksReceived = 0;
     console.log('Captura detenida');
     this.chunkSubject.complete();
   }
