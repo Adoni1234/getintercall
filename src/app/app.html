@@ -1,11 +1,9 @@
 <div class="app-container">
-  <!-- Translation Panel (Left Side) - FIJO, no se puede colapsar -->
+  <!-- Translation Panel (Left Side) - FIJO -->
   <div class="translation-panel">
     <div class="panel-header">
       <h3>🌐 Traducciones</h3>
-      <button mat-icon-button (click)="clearAllTranslations()" class="clear-btn" *ngIf="translations.length > 0" title="Limpiar todo">
-        🧹
-      </button>
+      <button class="clear-btn" *ngIf="translations.length > 0" (click)="clearAllTranslations()" title="Limpiar todo">🧹</button>
     </div>
     
     <div class="panel-content">
@@ -15,18 +13,11 @@
       
       <div *ngFor="let translation of translations; let i = index" class="translation-item">
         <div class="translation-header">
-          <button mat-icon-button (click)="removeTranslation(i)" class="delete-btn" title="Eliminar">
-            🗑️
-          </button>
+          <button class="delete-btn" (click)="removeTranslation(i)" title="Eliminar">🗑️</button>
         </div>
-        
         <div class="translation-content">
-          <div class="original">
-            <p>{{ translation.original }}</p>
-          </div>
-          
+          <div class="original"><p>{{ translation.original }}</p></div>
           <div class="arrow">↓</div>
-          
           <div class="translated">
             <p *ngIf="!translation.translating && translation.translated">{{ translation.translated }}</p>
             <div *ngIf="translation.translating" class="translating">
@@ -35,9 +26,7 @@
             </div>
             <div *ngIf="!translation.translating && !translation.translated" class="error-message">
               <span>⚠️ Error al traducir</span>
-              <button mat-button color="primary" (click)="translateItem(translation)" class="retry-btn">
-                🔄 Reintentar
-              </button>
+              <button mat-button color="primary" (click)="translateItem(translation)" class="retry-btn">🔄 Reintentar</button>
             </div>
           </div>
         </div>
@@ -56,29 +45,35 @@
       </mat-card-header>
 
       <mat-card-content>
-        <div class="button-group">
-          <button mat-raised-button color="primary" (click)="startRecording()" [disabled]="isRecording">
-            🎙️ Iniciar
-          </button>
-          <button mat-raised-button color="warn" (click)="stopRecording()" [disabled]="!isRecording">
-            🛑 Detener
-          </button>
-          <button mat-raised-button color="accent" (click)="clearTranscription()" [disabled]="!isRecording || bloques.length === 0">
-            🧹 Limpiar
-          </button>
+        <div class="controls-row">
+          <div class="button-group">
+            <button mat-raised-button color="primary" (click)="startRecording()" [disabled]="isRecording">
+              🎙️ Iniciar
+            </button>
+            <button mat-raised-button color="warn" (click)="stopRecording()" [disabled]="!isRecording">
+              🛑 Detener
+            </button>
+            <button mat-raised-button color="accent" (click)="clearTranscription()" [disabled]="!isRecording || bloques.length === 0">
+              🧹 Limpiar
+            </button>
+          </div>
+
+          <!-- Cronómetro -->
+          <div class="timer" [class.active]="isRecording">
+            <span class="timer-icon">⏱️</span>
+            <span class="timer-display">{{ sessionDuration }}</span>
+          </div>
         </div>
 
         <mat-progress-spinner *ngIf="loading" mode="indeterminate" diameter="50"></mat-progress-spinner>
 
         <div class="transcription-container" #scrollMe (scroll)="onContainerScroll($event)" (mouseup)="onTextSelection()">
-          <!-- Bloques definitivos — sin número ni etiqueta de idioma -->
           <div *ngFor="let bloque of bloques" 
                class="bloque definitivo" 
                [attr.data-lang]="bloque.lang">
-            <p class="text" [attr.data-lang]="bloque.lang">{{ bloque.text }}</p>
+            <p class="text">{{ bloque.text }}</p>
           </div>
           
-          <!-- Bloque partial actual — sin etiqueta de idioma -->
           <div *ngIf="currentPartial.text.trim()" 
                class="bloque temporal" 
                [attr.data-lang]="currentPartial.lang"
@@ -87,7 +82,6 @@
             <small class="status">● En vivo</small>
           </div>
           
-          <!-- Estados vacíos -->
           <div *ngIf="loading && bloques.length === 0 && !currentPartial.text" class="loading">
             🎧 Escuchando audio de pestaña...
           </div>

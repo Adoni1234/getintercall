@@ -280,3 +280,52 @@ mat-progress-spinner {
     min-width: 280px;
   }
 }
+
+/* ── Cronómetro ──────────────────────────────────────────────────────────── */
+.controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 15px;
+}
+
+.button-group {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 0;
+}
+
+.timer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #f0f0f0;
+  border-radius: 8px;
+  padding: 8px 16px;
+  font-family: 'Courier New', monospace;
+  font-size: 20px;
+  font-weight: 700;
+  color: #666;
+  border: 2px solid #ddd;
+  transition: all 0.3s ease;
+  min-width: 160px;
+  justify-content: center;
+}
+
+.timer.active {
+  background: #e8f5e9;
+  border-color: #4caf50;
+  color: #2e7d32;
+  box-shadow: 0 0 8px rgba(76, 175, 80, 0.3);
+}
+
+.timer-icon {
+  font-size: 18px;
+}
+
+.timer-display {
+  letter-spacing: 2px;
+}
