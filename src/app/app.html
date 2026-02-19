@@ -1,36 +1,33 @@
 <div class="app-container">
-  <!-- Translation Panel (Left Side) -->
-  <div class="translation-panel" [class.collapsed]="!showTranslationPanel">
+  <!-- Translation Panel (Left Side) - FIJO, no se puede colapsar -->
+  <div class="translation-panel">
     <div class="panel-header">
       <h3>🌐 Traducciones</h3>
-      <button mat-icon-button (click)="toggleTranslationPanel()" class="toggle-btn">
-        {{ showTranslationPanel ? '◀' : '▶' }}
+      <button mat-icon-button (click)="clearAllTranslations()" class="clear-btn" *ngIf="translations.length > 0" title="Limpiar todo">
+        🧹
       </button>
     </div>
     
-    <div class="panel-content" *ngIf="showTranslationPanel">
+    <div class="panel-content">
       <div *ngIf="translations.length === 0" class="empty-translations">
         Selecciona texto para traducir
       </div>
       
       <div *ngFor="let translation of translations; let i = index" class="translation-item">
         <div class="translation-header">
-          <span class="translation-number">#{{ translations.length - i }}</span>
-          <button mat-icon-button (click)="removeTranslation(i)" class="delete-btn">
+          <button mat-icon-button (click)="removeTranslation(i)" class="delete-btn" title="Eliminar">
             🗑️
           </button>
         </div>
         
         <div class="translation-content">
           <div class="original">
-            <span class="label">{{ translation.sourceLang === 'es' ? '🇪🇸' : '🇺🇸' }} Original:</span>
             <p>{{ translation.original }}</p>
           </div>
           
           <div class="arrow">↓</div>
           
           <div class="translated">
-            <span class="label">{{ translation.targetLang === 'es' ? '🇪🇸' : '🇺🇸' }} Traducción:</span>
             <p *ngIf="!translation.translating && translation.translated">{{ translation.translated }}</p>
             <div *ngIf="translation.translating" class="translating">
               <mat-spinner diameter="20"></mat-spinner>
@@ -45,15 +42,6 @@
           </div>
         </div>
       </div>
-      
-      <button 
-        mat-raised-button 
-        color="warn" 
-        class="clear-all-btn"
-        *ngIf="translations.length > 0"
-        (click)="clearAllTranslations()">
-        🧹 Limpiar Todo
-      </button>
     </div>
   </div>
 
@@ -64,7 +52,6 @@
         <mat-card-title>GetIntercall - Transcripción Real-Time</mat-card-title>
         <mat-card-subtitle>
           Detección automática de inglés y español
-          <span *ngIf="bloques.length > 0" class="block-counter"> • {{bloques.length}} bloque{{bloques.length !== 1 ? 's' : ''}}</span>
         </mat-card-subtitle>
       </mat-card-header>
 
@@ -84,30 +71,23 @@
         <mat-progress-spinner *ngIf="loading" mode="indeterminate" diameter="50"></mat-progress-spinner>
 
         <div class="transcription-container" #scrollMe (scroll)="onContainerScroll($event)" (mouseup)="onTextSelection()">
-          <!-- Definitive blocks -->
-          <div *ngFor="let bloque of bloques; let i = index" 
+          <!-- Bloques definitivos — sin número ni etiqueta de idioma -->
+          <div *ngFor="let bloque of bloques" 
                class="bloque definitivo" 
                [attr.data-lang]="bloque.lang">
-            <p class="lang" [attr.data-lang]="bloque.lang">
-              {{ bloque.lang === 'es' ? '🇪🇸 Español' : '🇺🇸 English' }}
-            </p>
             <p class="text" [attr.data-lang]="bloque.lang">{{ bloque.text }}</p>
-            <small class="timestamp">Bloque {{ i + 1 }}</small>
           </div>
           
-          <!-- Current partial block -->
+          <!-- Bloque partial actual — sin etiqueta de idioma -->
           <div *ngIf="currentPartial.text.trim()" 
                class="bloque temporal" 
                [attr.data-lang]="currentPartial.lang"
                [ngClass]="{ 'no-pulse': !autoScrollEnabled }">
-            <p class="lang" [attr.data-lang]="currentPartial.lang">
-              {{ currentPartial.lang === 'es' ? '🇪🇸 Español' : '🇺🇸 English' }} - Escuchando...
-            </p>
             <p class="text">{{ currentPartial.text }}</p>
             <small class="status">● En vivo</small>
           </div>
           
-          <!-- Empty states -->
+          <!-- Estados vacíos -->
           <div *ngIf="loading && bloques.length === 0 && !currentPartial.text" class="loading">
             🎧 Escuchando audio de pestaña...
           </div>
