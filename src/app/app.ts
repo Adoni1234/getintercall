@@ -1,4 +1,4 @@
-import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy, OnInit } from '@angular/core';
+import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { AudioService } from './services/audio-service';
 import { MatCardModule } from '@angular/material/card';
@@ -10,17 +10,12 @@ import { io, Socket } from 'socket.io-client';
 import { environment } from '../environments/environment';
 import { Subscription } from 'rxjs';
 
+interface Bloque { text: string; lang: string; }
+
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [
-    CommonModule,
-    MatCardModule,
-    MatButtonModule,
-    MatSnackBarModule,
-    MatProgressSpinnerModule,
-    MatIconModule
-  ],
+  imports: [CommonModule, MatCardModule, MatButtonModule, MatSnackBarModule, MatProgressSpinnerModule, MatIconModule],
   templateUrl: './app.html',
   styleUrls: ['./app.css']
 })
@@ -30,7 +25,6 @@ export class App implements AfterViewChecked, OnDestroy {
   transcription = '';
   loading = false;
 
-  // ── Cronómetro ───────────────────────────────────────────────────────────
   sessionDuration = '00:00:00';
   private timerInterval: any = null;
   private sessionStartTime = 0;
@@ -39,29 +33,28 @@ export class App implements AfterViewChecked, OnDestroy {
 
   private socket: Socket;
   private sessionId = '';
-
   private audioService = inject(AudioService);
   private cdr = inject(ChangeDetectorRef);
   private snackBar = inject(MatSnackBar);
 
-  public currentPartial: { text: string; lang: string } = { text: '', lang: '' };
-  bloques: { text: string; lang: string }[] = [];
+  // ── Estado de transcripción ───────────────────────────────────────────────
+  partialEn: Bloque = { text: '', lang: 'en' };
+  partialEs: Bloque = { text: '', lang: 'es' };
+  private partialEnTs = 0;
+  private partialEsTs = 0;
+  private lastBlockEnTs = 0;
+  private lastBlockEsTs = 0;
+  bloques: Bloque[] = [];
 
+  // Panel de traducción
   showTranslationPanel = true;
-
   translations: Array<{
-    original: string;
-    translated: string;
-    sourceLang: string;
-    targetLang: string;
-    translating: boolean;
+    original: string; translated: string;
+    sourceLang: string; targetLang: string; translating: boolean;
   }> = [];
 
-  private silenceTimer: any = null;
-  private readonly SILENCE_TIMEOUT_MS = 5000;
-  private lastPartialTime = 0;
-  private previousTranscriptionLength = 0;
   autoScrollEnabled = true;
+  private previousTranscriptionLength = 0;
   private chunkSubscription: Subscription | null = null;
 
   constructor() {
@@ -73,19 +66,10 @@ export class App implements AfterViewChecked, OnDestroy {
       timeout: 20000,
     });
 
-    this.socket.on('connect', () => {
-      console.log('✅ Socket conectado a backend!');
-    });
-
-    this.socket.on('disconnect', () => {
-      console.log('⚠️ Socket desconectado — reconectando...');
-    });
-
-    // Al reconectar durante una sesión activa, reiniciar la transcripción
+    this.socket.on('connect', () => console.log('✅ Socket conectado'));
+    this.socket.on('disconnect', () => console.log('⚠️ Socket desconectado'));
     this.socket.on('reconnect', () => {
-      console.log('✅ Socket reconectado');
       if (this.isRecording && this.sessionId) {
-        console.log('🔄 Reiniciando sesión tras reconexión:', this.sessionId);
         this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
         this.socket.emit('startTranscription', { sessionId: this.sessionId });
       }
@@ -94,52 +78,147 @@ export class App implements AfterViewChecked, OnDestroy {
     this.socket.on('partialTranscript', (dataStr: string) => {
       try {
         const data = JSON.parse(dataStr);
-
         if (data.sessionId !== this.sessionId) return;
         if (!data.text?.trim()) return;
 
-        const newText = data.text.trim();
-        const detectedLang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
+        const text = data.text.trim();
+        const lang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
 
-        this.lastPartialTime = Date.now();
-
+        // ── CORRECCIÓN: buscar por originalText primero, luego por idioma ────
         if (data.isCorrection) {
-          // Reemplazar el último bloque con la versión corregida por Claude
-          if (this.bloques.length > 0) {
-            this.bloques[this.bloques.length - 1].text = newText;
-            this.updateTranscription();
-            this.cdr.detectChanges();
+          const norm = (s: string) => s.toLowerCase().replace(/[.,?!¿¡]/g,'').replace(/\s+/g,' ').trim();
+          let found = false;
+
+          // Si el backend envió originalText, buscar el bloque que coincida exactamente
+          if (data.originalText) {
+            const origNorm = norm(data.originalText);
+            for (let i = this.bloques.length - 1; i >= 0; i--) {
+              if (norm(this.bloques[i].text) === origNorm) {
+                this.bloques[i] = { text, lang };
+                console.log(`✨ Corrección [${this.bloques[i].lang}→${lang}]:`, text.substring(0, 50));
+                found = true;
+                break;
+              }
+            }
           }
-          return; // no procesar más
 
-        } else if (data.isNewTurn) {
-          this.currentPartial = { text: '', lang: '' };
-
-          const lastBlock = this.bloques[this.bloques.length - 1];
-          const timeSinceLastBlock = Date.now() - (this as any)._lastBlockTime;
-          // Solo mergear si: mismo idioma Y dentro de ventana de tiempo
-          const shouldMerge = lastBlock
-            && timeSinceLastBlock < 8000
-            && lastBlock.lang === detectedLang;
-
-          if (shouldMerge) {
-            lastBlock.text += ' ' + newText;
-          } else {
-            this.bloques.push({ text: newText, lang: detectedLang });
+          // Fallback: buscar por idioma (mismo comportamiento anterior)
+          if (!found) {
+            for (let i = this.bloques.length - 1; i >= 0; i--) {
+              if (this.bloques[i].lang === lang) {
+                this.bloques[i] = { text, lang };
+                console.log(`✨ Corrección [${lang}]:`, text.substring(0, 50));
+                break;
+              }
+            }
           }
-          (this as any)._lastBlockTime = Date.now();
 
-        } else if (data.isNewBlock || data.isLiveUpdate) {
-          // Reemplazar el partial en vivo con el texto completo
-          // Nunca se pierden palabras cuando AssemblyAI corrige internamente
-          this.currentPartial = { text: newText, lang: detectedLang };
-
-        } else {
-          // Fallback
-          this.currentPartial = { text: newText, lang: detectedLang };
+          this.render();
+          return;
         }
 
-        this.updateTranscription();
+        // ── NUEVO TURNO: bloque definitivo del backend ───────────────────────
+        if (data.isNewTurn || data.isForcedClose) {
+          if (lang === 'en') {
+            this.partialEn = { text: '', lang: 'en' };
+            this.partialEnTs = 0;
+            this.lastBlockEnTs = Date.now();
+          } else {
+            this.partialEs = { text: '', lang: 'es' };
+            this.partialEsTs = 0;
+            this.lastBlockEsTs = Date.now();
+          }
+
+          const norm = (s: string) => s.toLowerCase().replace(/[.,?!¿¡]/g,'').replace(/\s+/g,' ').trim()
+            .replace(/keppra/gi, 'kepra').replace(/sí,?\s*/gi, 'si ').trim();
+          const normNew = norm(text);
+
+          // Buscar el último bloque del MISMO idioma
+          const lastSameIdx = (() => {
+            for (let i = this.bloques.length - 1; i >= 0; i--) {
+              if (this.bloques[i].lang === lang) return i;
+            }
+            return -1;
+          })();
+
+          // También buscar el último bloque de CUALQUIER idioma que sea prefijo del nuevo texto
+          // (cubre el caso donde el bloque fue corregido a otro idioma por Claude)
+          const lastAnyIdx = (() => {
+            for (let i = this.bloques.length - 1; i >= 0; i--) {
+              const normPrev = norm(this.bloques[i].text);
+              const prefix = normPrev.substring(0, Math.min(normPrev.length, 15));
+              if (prefix.length >= 4 && normNew.startsWith(prefix) && normNew.length > normPrev.length) {
+                return i;
+              }
+            }
+            return -1;
+          })();
+
+          const msSinceBlock = lang === 'en' ? Date.now() - this.lastBlockEnTs : Date.now() - this.lastBlockEsTs;
+
+          // Primero verificar extensión cross-idioma (bloque corregido a otro idioma)
+          if (lastAnyIdx >= 0 && msSinceBlock < 3000 && lastAnyIdx !== lastSameIdx) {
+            this.bloques[lastAnyIdx] = { text, lang };
+            console.log(`🔄 Bloque extendido [cross-lang→${lang}]:`, text.substring(0, 60));
+            this.render();
+            return;
+          }
+
+          if (lastSameIdx >= 0 && msSinceBlock < 3000) {
+            const normPrev = norm(this.bloques[lastSameIdx].text);
+            const isExtension = normNew.startsWith(normPrev.substring(0, Math.min(20, normPrev.length)))
+              && normNew.length > normPrev.length;
+            const isShortBackchannel = normNew.split(/\s+/).filter(Boolean).length <= 2;
+            const isDuplicate = !isShortBackchannel && (normNew === normPrev
+              || normPrev.startsWith(normNew.substring(0, Math.min(20, normNew.length))));
+            if (isExtension) {
+              this.bloques[lastSameIdx] = { text, lang };
+              console.log(`🔄 Bloque extendido [${lang}]:`, text.substring(0, 60));
+              this.render();
+              return;
+            }
+            if (isDuplicate) {
+              console.log(`🔇 Bloque duplicado [${lang}] ignorado:`, text.substring(0, 60));
+              this.render();
+              return;
+            }
+          }
+          this.bloques.push({ text, lang });
+          console.log(`✅ Bloque [${lang}]:`, text.substring(0, 60));
+          this.render();
+          return;
+        }
+
+        // ── PARTIAL: preview en vivo ────────────────────────────────────────
+        const now = Date.now();
+        const lastBlockTs = lang === 'en' ? this.lastBlockEnTs : this.lastBlockEsTs;
+        if (now - lastBlockTs < 400) {
+          console.log(`🔇 Partial [${lang}] ignorado (eco post-bloque):`, text.substring(0, 40));
+          return;
+        }
+
+        if (lang === 'en') {
+          const currentEn = this.partialEn.text;
+          if (!currentEn || text.length >= currentEn.length * 0.7 || text.length > currentEn.length) {
+            this.partialEn = { text, lang: 'en' };
+          }
+          this.partialEnTs = now;
+          if (this.partialEs.text && now - this.partialEsTs > 2500) {
+            this.partialEs = { text: '', lang: 'es' };
+          }
+        } else {
+          const currentEs = this.partialEs.text;
+          if (!currentEs || text.length >= currentEs.length * 0.7 || text.length > currentEs.length) {
+            this.partialEs = { text, lang: 'es' };
+          }
+          this.partialEsTs = now;
+          if (this.partialEn.text && now - this.partialEnTs > 2500) {
+            this.partialEn = { text: '', lang: 'en' };
+          }
+        }
+
+        console.log(`📝 Partial [${lang}]:`, text.substring(0, 50));
+        this.render();
 
       } catch (e) {
         console.error('❌ Error parsing partialTranscript:', e, dataStr);
@@ -150,127 +229,68 @@ export class App implements AfterViewChecked, OnDestroy {
       this.snackBar.open(err.message || 'Error en backend', 'OK', { duration: 5000 });
     });
 
-    this.socket.on('started', (data: any) => {
-      console.log('✅ Real-time iniciado para session', data.sessionId);
+    this.socket.on('started', () => {
       this.loading = false;
-      this.startSilenceTimer();
     });
 
-    this.socket.on('stopped', (data: any) => {
-      console.log('🛑 Real-time detenido para session', data.sessionId);
-      this.stopSilenceTimer();
-      // Si aún estamos grabando (no se llamó stopRecording) — cerrar bloque pendiente
-      // Si ya se llamó stopRecording, currentPartial ya está vacío — no hacer nada
-      if (this.isRecording && this.currentPartial.text.trim()) {
-        this.bloques.push({ ...this.currentPartial });
-        this.currentPartial = { text: '', lang: '' };
-        this.updateTranscription();
+    this.socket.on('stopped', () => {
+      if (this.partialEn.text.trim()) {
+        this.bloques.push({ ...this.partialEn });
+        this.partialEn = { text: '', lang: 'en' };
       }
+      if (this.partialEs.text.trim()) {
+        this.bloques.push({ ...this.partialEs });
+        this.partialEs = { text: '', lang: 'es' };
+      }
+      this.render();
     });
   }
 
-  // ── Cronómetro ───────────────────────────────────────────────────────────
-  private startTimer(): void {
-    this.sessionStartTime = Date.now();
-    this.sessionDuration = '00:00:00';
-    this.timerInterval = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
-      const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-      const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-      const s = (elapsed % 60).toString().padStart(2, '0');
-      this.sessionDuration = `${h}:${m}:${s}`;
-      this.cdr.detectChanges();
-    }, 1000);
-  }
-
-  private stopTimer(): void {
-    if (this.timerInterval) {
-      clearInterval(this.timerInterval);
-      this.timerInterval = null;
-    }
-    this.sessionDuration = '00:00:00';
-  }
-
-  // ── Silence timer ────────────────────────────────────────────────────────
-  private startSilenceTimer(): void {
-    (this as any)._lastBlockTime = Date.now();
-    this.silenceTimer = setInterval(() => {
-      if (!this.isRecording) return;
-      if (!this.currentPartial.text.trim()) return;
-
-      const elapsed = Date.now() - this.lastPartialTime;
-      if (elapsed > this.SILENCE_TIMEOUT_MS) {
-        this.bloques.push({ ...this.currentPartial });
-        (this as any)._lastBlockTime = Date.now();
-        this.currentPartial = { text: '', lang: '' };
-        this.lastPartialTime = Date.now();
-        this.updateTranscription();
-      }
-    }, 500);
-  }
-
-  private stopSilenceTimer(): void {
-    if (this.silenceTimer) {
-      clearInterval(this.silenceTimer);
-      this.silenceTimer = null;
-    }
-  }
-
-  private updateTranscription(): void {
-    const allBlocks = [...this.bloques];
-    if (this.currentPartial.text.trim()) allBlocks.push(this.currentPartial);
-
-    this.transcription = allBlocks
+  private render(): void {
+    const toShow: Bloque[] = [...this.bloques];
+    this.transcription = toShow
       .filter(b => b.text.trim())
       .map(b => b.text)
       .join('\n\n');
-
     this.cdr.detectChanges();
-
     if (this.transcription.length > this.previousTranscriptionLength) {
-      setTimeout(() => this.scrollToBottom(), 100);
+      setTimeout(() => this.scrollToBottom(), 50);
       this.previousTranscriptionLength = this.transcription.length;
     }
+  }
+
+  get activePartial(): Bloque | null {
+    const hasEn = this.partialEn.text.trim().length > 0;
+    const hasEs = this.partialEs.text.trim().length > 0;
+    if (!hasEn && !hasEs) return null;
+    if (hasEn && !hasEs) return this.partialEn;
+    if (!hasEn && hasEs) return this.partialEs;
+    return this.partialEn.text.length >= this.partialEs.text.length
+      ? this.partialEn : this.partialEs;
   }
 
   async startRecording() {
     try {
       await this.audioService.startTabAudioCapture();
-
       this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-
       this.isRecording = true;
       this.transcription = '';
       this.bloques = [];
-      this.currentPartial = { text: '', lang: '' };
-      this.lastPartialTime = Date.now();
+      this.partialEn = { text: '', lang: 'en' };
+      this.partialEs = { text: '', lang: 'es' };
       this.previousTranscriptionLength = 0;
-      (this as any)._lastBlockTime = Date.now();
       this.loading = true;
-
-      // FIX 3: Limpiar traducciones al iniciar nueva sesión
       this.translations = [];
-
       this.startTimer();
-
       this.snackBar.open('🎙️ Transcripción real-time iniciada...', 'OK', { duration: 3000 });
       this.socket.emit('startTranscription', { sessionId: this.sessionId });
 
-      if (this.chunkSubscription) {
-        this.chunkSubscription.unsubscribe();
-        this.chunkSubscription = null;
-      }
-
+      if (this.chunkSubscription) { this.chunkSubscription.unsubscribe(); this.chunkSubscription = null; }
       this.chunkSubscription = this.audioService.chunk$.subscribe((buffer: ArrayBuffer) => {
         const uint8 = new Uint8Array(buffer);
-        this.socket.emit('audioChunk', {
-          sessionId: this.sessionId,
-          chunk: Array.from(uint8)
-        });
+        this.socket.emit('audioChunk', { sessionId: this.sessionId, chunk: Array.from(uint8) });
       });
-
     } catch (err: any) {
-      console.error('❌ Error:', err);
       this.loading = false;
       this.isRecording = false;
       this.stopTimer();
@@ -287,65 +307,59 @@ export class App implements AfterViewChecked, OnDestroy {
     this.audioService.stopRecording();
     this.isRecording = false;
     this.loading = false;
-    this.stopSilenceTimer();
     this.stopTimer();
-
-    if (this.chunkSubscription) {
-      this.chunkSubscription.unsubscribe();
-      this.chunkSubscription = null;
-    }
-
-    // Limpiar el bloque "en vivo" inmediatamente — sin esperar al evento 'stopped'
-    this.currentPartial = { text: '', lang: '' };
+    if (this.chunkSubscription) { this.chunkSubscription.unsubscribe(); this.chunkSubscription = null; }
+    this.partialEn = { text: '', lang: 'en' };
+    this.partialEs = { text: '', lang: 'es' };
     this.bloques = [];
     this.transcription = '';
     this.translations = [];
     this.previousTranscriptionLength = 0;
     this.cdr.detectChanges();
-
     this.snackBar.open('🛑 Transcripción detenida.', 'OK', { duration: 2000 });
   }
 
-  // Limpia todo — transcripción + traducciones
-  private clearAll(): void {
+  clearTranscription() {
+    const wasEmpty = this.bloques.length === 0 && !this.partialEn.text && !this.partialEs.text;
     this.transcription = '';
     this.bloques = [];
-    this.currentPartial = { text: '', lang: '' };
+    this.partialEn = { text: '', lang: 'en' };
+    this.partialEs = { text: '', lang: 'es' };
     this.previousTranscriptionLength = 0;
-    this.translations = [];
     this.cdr.detectChanges();
+    if (!wasEmpty) this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
   }
 
-  clearTranscription() {
-    const wasEmpty = this.bloques.length === 0 && !this.currentPartial.text.trim();
-    this.transcription = '';
-    this.bloques = [];
-    this.currentPartial = { text: '', lang: '' };
-    this.previousTranscriptionLength = 0;
-    this.cdr.detectChanges();
-    if (!wasEmpty) {
-      this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
-    }
+  private startTimer(): void {
+    this.sessionStartTime = Date.now();
+    this.sessionDuration = '00:00:00';
+    this.timerInterval = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
+      const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
+      const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
+      const s = (elapsed % 60).toString().padStart(2, '0');
+      this.sessionDuration = `${h}:${m}:${s}`;
+      this.cdr.detectChanges();
+    }, 1000);
+  }
+
+  private stopTimer(): void {
+    if (this.timerInterval) { clearInterval(this.timerInterval); this.timerInterval = null; }
+    this.sessionDuration = '00:00:00';
   }
 
   private detectLanguageFrontend(text: string): 'es' | 'en' {
-    const cleanText = text.toLowerCase().trim();
-    if (/[áéíóúñ¿¡]/i.test(cleanText)) return 'es';
-    const spanishPattern = /\b(de|del|el|la|los|las|un|una|está|están|son|es|como|qué|cómo|por|para|con|sin|pero|y|o|mi|tu|su|me|te|se|lo|le|ha|he|sido|sé|vamos|hacer|entonces|solo|más|nada|esto|no|que|muy|aquí|allí|bien|mal|todo|siempre|nunca|cuando|donde|mucho|poco|grande|nuevo|bueno|malo|si|sí|ver|ir|voy|va|hago|dice|ser|estar|tener|tengo|tiene|poder|puedo|querer|quiero|deber|debe|año|día|vez|cosa|gente|tiempo|vida|casa|ciudad|desde|hasta|otro|mismo|cada|todos|estamos)\b/gi;
-    const words = cleanText.split(/\s+/).filter(w => w.length > 0);
-    const spanishMatches = cleanText.match(spanishPattern);
-    const spanishWordCount = spanishMatches ? spanishMatches.length : 0;
-    const spanishRatio = words.length > 0 ? spanishWordCount / words.length : 0;
-    if (words.length <= 5 && spanishWordCount >= 1) return 'es';
-    if (spanishRatio >= 0.18) return 'es';
+    const t = text.toLowerCase().trim();
+    if (/[áéíóúñ¿¡]/i.test(t)) return 'es';
+    if (/^(sí|si|no|ya|yo|mi|tu|su|lo|la|le|un|al|del|eh|ay|fue|hay|hoy|más|nos|eso|ese|esa|con|por|que|muy|son|han|van|voy|soy|da|ir)$/.test(t)) return 'es';
+    if (/\b(de|del|el|la|los|las|un|una|está|son|es|por|para|con|pero|y|me|te|se|lo|le|sí|desde|hace|porque|cuando|tengo|tiene)\b/gi.test(t)) return 'es';
     return 'en';
   }
 
   addTranslation(text: string): void {
     const isSpanish = this.detectLanguageFrontend(text) === 'es';
     const translation = {
-      original: text,
-      translated: '',
+      original: text, translated: '',
       sourceLang: isSpanish ? 'es' : 'en',
       targetLang: isSpanish ? 'en' : 'es',
       translating: true
@@ -362,77 +376,30 @@ export class App implements AfterViewChecked, OnDestroy {
       let translated = '';
       let success = false;
 
-      // 1. MyMemory — gratuito, sin API key, soporta es/en bien
       try {
-        const langPair = `${translation.sourceLang}|${translation.targetLang}`;
-        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${langPair}`;
+        const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${translation.sourceLang}|${translation.targetLang}`;
         const response = await fetch(url);
         if (response.ok) {
           const data = await response.json();
           if (data.responseStatus === 200 && data.responseData?.translatedText) {
             const t = data.responseData.translatedText;
-            // MyMemory devuelve el texto original si no pudo traducir
-            if (t && t !== textToTranslate && !t.toLowerCase().includes('mymemory')) {
-              translated = t;
-              success = true;
-            }
+            if (t && t !== textToTranslate && !t.toLowerCase().includes('mymemory')) { translated = t; success = true; }
           }
         }
-      } catch { /* fallback */ }
+      } catch { }
 
-      // 2. Lingva (instancia pública de Google Translate sin API key)
       if (!success) {
         try {
-          const src = translation.sourceLang;
-          const tgt = translation.targetLang;
-          const url = `https://lingva.ml/api/v1/${src}/${tgt}/${encodeURIComponent(textToTranslate)}`;
+          const url = `https://lingva.ml/api/v1/${translation.sourceLang}/${translation.targetLang}/${encodeURIComponent(textToTranslate)}`;
           const response = await fetch(url);
-          if (response.ok) {
-            const data = await response.json();
-            if (data.translation) {
-              translated = data.translation;
-              success = true;
-            }
-          }
-        } catch { /* fallback */ }
+          if (response.ok) { const data = await response.json(); if (data.translation) { translated = data.translation; success = true; } }
+        } catch { }
       }
 
-      // 3. Claude API como último recurso
-      if (!success) {
-        try {
-          const targetName = translation.targetLang === 'es' ? 'Spanish' : 'English';
-          const response = await fetch('https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: 'claude-sonnet-4-20250514',
-              max_tokens: 1000,
-              messages: [{
-                role: 'user',
-                content: `Translate this text to ${targetName}. Reply with ONLY the translation, no explanation:
-
-${textToTranslate}`
-              }]
-            })
-          });
-          if (response.ok) {
-            const data = await response.json();
-            if (data.content?.[0]?.text) {
-              translated = data.content[0].text.trim();
-              success = true;
-            }
-          }
-        } catch { /* todos los fallbacks fallaron */ }
-      }
-
-      if (success && translated) {
-        translation.translated = translated;
-      } else {
-        translation.translated = '⚠️ Traducción no disponible';
-      }
+      translation.translated = success && translated ? translated : '⚠️ Traducción no disponible';
       translation.translating = false;
       this.cdr.detectChanges();
-    } catch (error) {
+    } catch {
       translation.translated = '⚠️ Error al traducir';
       translation.translating = false;
       this.cdr.detectChanges();
@@ -444,21 +411,14 @@ ${textToTranslate}`
     const selectedText = selection?.toString().trim();
     if (selectedText && selectedText.length > 0) {
       const textToTranslate = selectedText.length > 500 ? selectedText.substring(0, 500) : selectedText;
-      if (selectedText.length > 500) {
-        this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
-      }
+      if (selectedText.length > 500) this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
       this.addTranslation(textToTranslate);
       selection?.removeAllRanges();
     }
   }
 
   removeTranslation(index: number): void { this.translations.splice(index, 1); }
-
-  clearAllTranslations(): void {
-    this.translations = [];
-    this.snackBar.open('🧹 Traducciones limpiadas', 'OK', { duration: 1500 });
-  }
-
+  clearAllTranslations(): void { this.translations = []; }
   toggleTranslationPanel(): void {}
   async translateSelection(): Promise<void> {}
   closeTranslation(): void {}
@@ -468,7 +428,6 @@ ${textToTranslate}`
   }
 
   ngOnDestroy() {
-    this.stopSilenceTimer();
     this.stopTimer();
     if (this.chunkSubscription) this.chunkSubscription.unsubscribe();
     this.socket.disconnect();
@@ -489,12 +448,11 @@ ${textToTranslate}`
     return false;
   }
 
-  onContainerScroll(event: Event): void {
+  onContainerScroll(): void {
     this.autoScrollEnabled = this.isAtBottom();
   }
 }
-
-// import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy, OnInit } from '@angular/core';
+// import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy } from '@angular/core';
 // import { CommonModule } from '@angular/common';
 // import { AudioService } from './services/audio-service';
 // import { MatCardModule } from '@angular/material/card';
@@ -506,17 +464,12 @@ ${textToTranslate}`
 // import { environment } from '../environments/environment';
 // import { Subscription } from 'rxjs';
 
+// interface Bloque { text: string; lang: string; }
+
 // @Component({
 //   selector: 'app-root',
 //   standalone: true,
-//   imports: [
-//     CommonModule,
-//     MatCardModule,
-//     MatButtonModule,
-//     MatSnackBarModule,
-//     MatProgressSpinnerModule,
-//     MatIconModule
-//   ],
+//   imports: [CommonModule, MatCardModule, MatButtonModule, MatSnackBarModule, MatProgressSpinnerModule, MatIconModule],
 //   templateUrl: './app.html',
 //   styleUrls: ['./app.css']
 // })
@@ -526,7 +479,6 @@ ${textToTranslate}`
 //   transcription = '';
 //   loading = false;
 
-//   // ── Cronómetro ───────────────────────────────────────────────────────────
 //   sessionDuration = '00:00:00';
 //   private timerInterval: any = null;
 //   private sessionStartTime = 0;
@@ -535,29 +487,28 @@ ${textToTranslate}`
 
 //   private socket: Socket;
 //   private sessionId = '';
-
 //   private audioService = inject(AudioService);
 //   private cdr = inject(ChangeDetectorRef);
 //   private snackBar = inject(MatSnackBar);
 
-//   public currentPartial: { text: string; lang: string } = { text: '', lang: '' };
-//   bloques: { text: string; lang: string }[] = [];
+//   // ── Estado de transcripción ───────────────────────────────────────────────
+//   partialEn: Bloque = { text: '', lang: 'en' };
+//   partialEs: Bloque = { text: '', lang: 'es' };
+//   private partialEnTs = 0;
+//   private partialEsTs = 0;
+//   private lastBlockEnTs = 0;
+//   private lastBlockEsTs = 0;
+//   bloques: Bloque[] = [];
 
+//   // Panel de traducción
 //   showTranslationPanel = true;
-
 //   translations: Array<{
-//     original: string;
-//     translated: string;
-//     sourceLang: string;
-//     targetLang: string;
-//     translating: boolean;
+//     original: string; translated: string;
+//     sourceLang: string; targetLang: string; translating: boolean;
 //   }> = [];
 
-//   private silenceTimer: any = null;
-//   private readonly SILENCE_TIMEOUT_MS = 5000;
-//   private lastPartialTime = 0;
-//   private previousTranscriptionLength = 0;
 //   autoScrollEnabled = true;
+//   private previousTranscriptionLength = 0;
 //   private chunkSubscription: Subscription | null = null;
 
 //   constructor() {
@@ -569,19 +520,10 @@ ${textToTranslate}`
 //       timeout: 20000,
 //     });
 
-//     this.socket.on('connect', () => {
-//       console.log('✅ Socket conectado a backend!');
-//     });
-
-//     this.socket.on('disconnect', () => {
-//       console.log('⚠️ Socket desconectado — reconectando...');
-//     });
-
-//     // Al reconectar durante una sesión activa, reiniciar la transcripción
+//     this.socket.on('connect', () => console.log('✅ Socket conectado'));
+//     this.socket.on('disconnect', () => console.log('⚠️ Socket desconectado'));
 //     this.socket.on('reconnect', () => {
-//       console.log('✅ Socket reconectado');
 //       if (this.isRecording && this.sessionId) {
-//         console.log('🔄 Reiniciando sesión tras reconexión:', this.sessionId);
 //         this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 //         this.socket.emit('startTranscription', { sessionId: this.sessionId });
 //       }
@@ -590,43 +532,146 @@ ${textToTranslate}`
 //     this.socket.on('partialTranscript', (dataStr: string) => {
 //       try {
 //         const data = JSON.parse(dataStr);
-
 //         if (data.sessionId !== this.sessionId) return;
 //         if (!data.text?.trim()) return;
 
-//         const newText = data.text.trim();
-//         const detectedLang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
+//         const text = data.text.trim();
+//         const lang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
 
-//         this.lastPartialTime = Date.now();
+//         // ── CORRECCIÓN: buscar por originalText primero, luego por idioma ────
+//         if (data.isCorrection) {
+//           const norm = (s: string) => s.toLowerCase().replace(/[.,?!¿¡]/g,'').replace(/\s+/g,' ').trim();
+//           let found = false;
 
-//         if (data.isNewTurn) {
-//           this.currentPartial = { text: '', lang: '' };
-
-//           const lastBlock = this.bloques[this.bloques.length - 1];
-//           const timeSinceLastBlock = Date.now() - (this as any)._lastBlockTime;
-//           const shouldMerge = lastBlock && timeSinceLastBlock < 8000;
-
-//           if (shouldMerge) {
-//             lastBlock.text += ' ' + newText;
-//           } else {
-//             this.bloques.push({ text: newText, lang: detectedLang });
+//           // Si el backend envió originalText, buscar el bloque que coincida exactamente
+//           if (data.originalText) {
+//             const origNorm = norm(data.originalText);
+//             for (let i = this.bloques.length - 1; i >= 0; i--) {
+//               if (norm(this.bloques[i].text) === origNorm) {
+//                 this.bloques[i] = { text, lang };
+//                 console.log(`✨ Corrección [${this.bloques[i].lang}→${lang}]:`, text.substring(0, 50));
+//                 found = true;
+//                 break;
+//               }
+//             }
 //           }
-//           (this as any)._lastBlockTime = Date.now();
 
-//         } else if (data.isNewBlock) {
-//           this.currentPartial = { text: newText, lang: detectedLang };
+//           // Fallback: buscar por idioma (mismo comportamiento anterior)
+//           if (!found) {
+//             for (let i = this.bloques.length - 1; i >= 0; i--) {
+//               if (this.bloques[i].lang === lang) {
+//                 this.bloques[i] = { text, lang };
+//                 console.log(`✨ Corrección [${lang}]:`, text.substring(0, 50));
+//                 break;
+//               }
+//             }
+//           }
 
-//         } else {
-//           if (this.currentPartial.text) {
-//             this.currentPartial.text += ' ' + newText;
-//             const wordCount = this.currentPartial.text.split(/\s+/).filter(Boolean).length;
-//             if (wordCount < 5) this.currentPartial.lang = detectedLang;
+//           this.render();
+//           return;
+//         }
+
+//         // ── NUEVO TURNO: bloque definitivo del backend ───────────────────────
+//         if (data.isNewTurn || data.isForcedClose) {
+//           if (lang === 'en') {
+//             this.partialEn = { text: '', lang: 'en' };
+//             this.partialEnTs = 0;
+//             this.lastBlockEnTs = Date.now();
 //           } else {
-//             this.currentPartial = { text: newText, lang: detectedLang };
+//             this.partialEs = { text: '', lang: 'es' };
+//             this.partialEsTs = 0;
+//             this.lastBlockEsTs = Date.now();
+//           }
+
+//           const norm = (s: string) => s.toLowerCase().replace(/[.,?!¿¡]/g,'').replace(/\s+/g,' ').trim()
+//             .replace(/keppra/gi, 'kepra').replace(/sí,?\s*/gi, 'si ').trim();
+//           const normNew = norm(text);
+
+//           // Buscar el último bloque del MISMO idioma
+//           const lastSameIdx = (() => {
+//             for (let i = this.bloques.length - 1; i >= 0; i--) {
+//               if (this.bloques[i].lang === lang) return i;
+//             }
+//             return -1;
+//           })();
+
+//           // También buscar el último bloque de CUALQUIER idioma que sea prefijo del nuevo texto
+//           // (cubre el caso donde el bloque fue corregido a otro idioma por Claude)
+//           const lastAnyIdx = (() => {
+//             for (let i = this.bloques.length - 1; i >= 0; i--) {
+//               const normPrev = norm(this.bloques[i].text);
+//               const prefix = normPrev.substring(0, Math.min(normPrev.length, 15));
+//               if (prefix.length >= 4 && normNew.startsWith(prefix) && normNew.length > normPrev.length) {
+//                 return i;
+//               }
+//             }
+//             return -1;
+//           })();
+
+//           const msSinceBlock = lang === 'en' ? Date.now() - this.lastBlockEnTs : Date.now() - this.lastBlockEsTs;
+
+//           // Primero verificar extensión cross-idioma (bloque corregido a otro idioma)
+//           if (lastAnyIdx >= 0 && msSinceBlock < 3000 && lastAnyIdx !== lastSameIdx) {
+//             this.bloques[lastAnyIdx] = { text, lang };
+//             console.log(`🔄 Bloque extendido [cross-lang→${lang}]:`, text.substring(0, 60));
+//             this.render();
+//             return;
+//           }
+
+//           if (lastSameIdx >= 0 && msSinceBlock < 3000) {
+//             const normPrev = norm(this.bloques[lastSameIdx].text);
+//             const isExtension = normNew.startsWith(normPrev.substring(0, Math.min(20, normPrev.length)))
+//               && normNew.length > normPrev.length;
+//             const isDuplicate = normNew === normPrev
+//               || normPrev.startsWith(normNew.substring(0, Math.min(20, normNew.length)));
+//             if (isExtension) {
+//               this.bloques[lastSameIdx] = { text, lang };
+//               console.log(`🔄 Bloque extendido [${lang}]:`, text.substring(0, 60));
+//               this.render();
+//               return;
+//             }
+//             if (isDuplicate) {
+//               console.log(`🔇 Bloque duplicado [${lang}] ignorado:`, text.substring(0, 60));
+//               this.render();
+//               return;
+//             }
+//           }
+//           this.bloques.push({ text, lang });
+//           console.log(`✅ Bloque [${lang}]:`, text.substring(0, 60));
+//           this.render();
+//           return;
+//         }
+
+//         // ── PARTIAL: preview en vivo ────────────────────────────────────────
+//         const now = Date.now();
+//         const lastBlockTs = lang === 'en' ? this.lastBlockEnTs : this.lastBlockEsTs;
+//         if (now - lastBlockTs < 400) {
+//           console.log(`🔇 Partial [${lang}] ignorado (eco post-bloque):`, text.substring(0, 40));
+//           return;
+//         }
+
+//         if (lang === 'en') {
+//           const currentEn = this.partialEn.text;
+//           if (!currentEn || text.length >= currentEn.length * 0.7 || text.length > currentEn.length) {
+//             this.partialEn = { text, lang: 'en' };
+//           }
+//           this.partialEnTs = now;
+//           if (this.partialEs.text && now - this.partialEsTs > 2500) {
+//             this.partialEs = { text: '', lang: 'es' };
+//           }
+//         } else {
+//           const currentEs = this.partialEs.text;
+//           if (!currentEs || text.length >= currentEs.length * 0.7 || text.length > currentEs.length) {
+//             this.partialEs = { text, lang: 'es' };
+//           }
+//           this.partialEsTs = now;
+//           if (this.partialEn.text && now - this.partialEnTs > 2500) {
+//             this.partialEn = { text: '', lang: 'en' };
 //           }
 //         }
 
-//         this.updateTranscription();
+//         console.log(`📝 Partial [${lang}]:`, text.substring(0, 50));
+//         this.render();
 
 //       } catch (e) {
 //         console.error('❌ Error parsing partialTranscript:', e, dataStr);
@@ -637,127 +682,68 @@ ${textToTranslate}`
 //       this.snackBar.open(err.message || 'Error en backend', 'OK', { duration: 5000 });
 //     });
 
-//     this.socket.on('started', (data: any) => {
-//       console.log('✅ Real-time iniciado para session', data.sessionId);
+//     this.socket.on('started', () => {
 //       this.loading = false;
-//       this.startSilenceTimer();
 //     });
 
-//     this.socket.on('stopped', (data: any) => {
-//       console.log('🛑 Real-time detenido para session', data.sessionId);
-//       this.stopSilenceTimer();
-//       // Si aún estamos grabando (no se llamó stopRecording) — cerrar bloque pendiente
-//       // Si ya se llamó stopRecording, currentPartial ya está vacío — no hacer nada
-//       if (this.isRecording && this.currentPartial.text.trim()) {
-//         this.bloques.push({ ...this.currentPartial });
-//         this.currentPartial = { text: '', lang: '' };
-//         this.updateTranscription();
+//     this.socket.on('stopped', () => {
+//       if (this.partialEn.text.trim()) {
+//         this.bloques.push({ ...this.partialEn });
+//         this.partialEn = { text: '', lang: 'en' };
 //       }
+//       if (this.partialEs.text.trim()) {
+//         this.bloques.push({ ...this.partialEs });
+//         this.partialEs = { text: '', lang: 'es' };
+//       }
+//       this.render();
 //     });
 //   }
 
-//   // ── Cronómetro ───────────────────────────────────────────────────────────
-//   private startTimer(): void {
-//     this.sessionStartTime = Date.now();
-//     this.sessionDuration = '00:00:00';
-//     this.timerInterval = setInterval(() => {
-//       const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
-//       const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-//       const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-//       const s = (elapsed % 60).toString().padStart(2, '0');
-//       this.sessionDuration = `${h}:${m}:${s}`;
-//       this.cdr.detectChanges();
-//     }, 1000);
-//   }
-
-//   private stopTimer(): void {
-//     if (this.timerInterval) {
-//       clearInterval(this.timerInterval);
-//       this.timerInterval = null;
-//     }
-//     this.sessionDuration = '00:00:00';
-//   }
-
-//   // ── Silence timer ────────────────────────────────────────────────────────
-//   private startSilenceTimer(): void {
-//     (this as any)._lastBlockTime = Date.now();
-//     this.silenceTimer = setInterval(() => {
-//       if (!this.isRecording) return;
-//       if (!this.currentPartial.text.trim()) return;
-
-//       const elapsed = Date.now() - this.lastPartialTime;
-//       if (elapsed > this.SILENCE_TIMEOUT_MS) {
-//         this.bloques.push({ ...this.currentPartial });
-//         (this as any)._lastBlockTime = Date.now();
-//         this.currentPartial = { text: '', lang: '' };
-//         this.lastPartialTime = Date.now();
-//         this.updateTranscription();
-//       }
-//     }, 500);
-//   }
-
-//   private stopSilenceTimer(): void {
-//     if (this.silenceTimer) {
-//       clearInterval(this.silenceTimer);
-//       this.silenceTimer = null;
-//     }
-//   }
-
-//   private updateTranscription(): void {
-//     const allBlocks = [...this.bloques];
-//     if (this.currentPartial.text.trim()) allBlocks.push(this.currentPartial);
-
-//     this.transcription = allBlocks
+//   private render(): void {
+//     const toShow: Bloque[] = [...this.bloques];
+//     this.transcription = toShow
 //       .filter(b => b.text.trim())
 //       .map(b => b.text)
 //       .join('\n\n');
-
 //     this.cdr.detectChanges();
-
 //     if (this.transcription.length > this.previousTranscriptionLength) {
-//       setTimeout(() => this.scrollToBottom(), 100);
+//       setTimeout(() => this.scrollToBottom(), 50);
 //       this.previousTranscriptionLength = this.transcription.length;
 //     }
+//   }
+
+//   get activePartial(): Bloque | null {
+//     const hasEn = this.partialEn.text.trim().length > 0;
+//     const hasEs = this.partialEs.text.trim().length > 0;
+//     if (!hasEn && !hasEs) return null;
+//     if (hasEn && !hasEs) return this.partialEn;
+//     if (!hasEn && hasEs) return this.partialEs;
+//     return this.partialEn.text.length >= this.partialEs.text.length
+//       ? this.partialEn : this.partialEs;
 //   }
 
 //   async startRecording() {
 //     try {
 //       await this.audioService.startTabAudioCapture();
-
 //       this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-
 //       this.isRecording = true;
 //       this.transcription = '';
 //       this.bloques = [];
-//       this.currentPartial = { text: '', lang: '' };
-//       this.lastPartialTime = Date.now();
+//       this.partialEn = { text: '', lang: 'en' };
+//       this.partialEs = { text: '', lang: 'es' };
 //       this.previousTranscriptionLength = 0;
-//       (this as any)._lastBlockTime = Date.now();
 //       this.loading = true;
-
-//       // FIX 3: Limpiar traducciones al iniciar nueva sesión
 //       this.translations = [];
-
 //       this.startTimer();
-
 //       this.snackBar.open('🎙️ Transcripción real-time iniciada...', 'OK', { duration: 3000 });
 //       this.socket.emit('startTranscription', { sessionId: this.sessionId });
 
-//       if (this.chunkSubscription) {
-//         this.chunkSubscription.unsubscribe();
-//         this.chunkSubscription = null;
-//       }
-
+//       if (this.chunkSubscription) { this.chunkSubscription.unsubscribe(); this.chunkSubscription = null; }
 //       this.chunkSubscription = this.audioService.chunk$.subscribe((buffer: ArrayBuffer) => {
 //         const uint8 = new Uint8Array(buffer);
-//         this.socket.emit('audioChunk', {
-//           sessionId: this.sessionId,
-//           chunk: Array.from(uint8)
-//         });
+//         this.socket.emit('audioChunk', { sessionId: this.sessionId, chunk: Array.from(uint8) });
 //       });
-
 //     } catch (err: any) {
-//       console.error('❌ Error:', err);
 //       this.loading = false;
 //       this.isRecording = false;
 //       this.stopTimer();
@@ -774,65 +760,59 @@ ${textToTranslate}`
 //     this.audioService.stopRecording();
 //     this.isRecording = false;
 //     this.loading = false;
-//     this.stopSilenceTimer();
 //     this.stopTimer();
-
-//     if (this.chunkSubscription) {
-//       this.chunkSubscription.unsubscribe();
-//       this.chunkSubscription = null;
-//     }
-
-//     // Limpiar el bloque "en vivo" inmediatamente — sin esperar al evento 'stopped'
-//     this.currentPartial = { text: '', lang: '' };
+//     if (this.chunkSubscription) { this.chunkSubscription.unsubscribe(); this.chunkSubscription = null; }
+//     this.partialEn = { text: '', lang: 'en' };
+//     this.partialEs = { text: '', lang: 'es' };
 //     this.bloques = [];
 //     this.transcription = '';
 //     this.translations = [];
 //     this.previousTranscriptionLength = 0;
 //     this.cdr.detectChanges();
-
 //     this.snackBar.open('🛑 Transcripción detenida.', 'OK', { duration: 2000 });
 //   }
 
-//   // Limpia todo — transcripción + traducciones
-//   private clearAll(): void {
+//   clearTranscription() {
+//     const wasEmpty = this.bloques.length === 0 && !this.partialEn.text && !this.partialEs.text;
 //     this.transcription = '';
 //     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
+//     this.partialEn = { text: '', lang: 'en' };
+//     this.partialEs = { text: '', lang: 'es' };
 //     this.previousTranscriptionLength = 0;
-//     this.translations = [];
 //     this.cdr.detectChanges();
+//     if (!wasEmpty) this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
 //   }
 
-//   clearTranscription() {
-//     const wasEmpty = this.bloques.length === 0 && !this.currentPartial.text.trim();
-//     this.transcription = '';
-//     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
-//     this.previousTranscriptionLength = 0;
-//     this.cdr.detectChanges();
-//     if (!wasEmpty) {
-//       this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
-//     }
+//   private startTimer(): void {
+//     this.sessionStartTime = Date.now();
+//     this.sessionDuration = '00:00:00';
+//     this.timerInterval = setInterval(() => {
+//       const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
+//       const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
+//       const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
+//       const s = (elapsed % 60).toString().padStart(2, '0');
+//       this.sessionDuration = `${h}:${m}:${s}`;
+//       this.cdr.detectChanges();
+//     }, 1000);
+//   }
+
+//   private stopTimer(): void {
+//     if (this.timerInterval) { clearInterval(this.timerInterval); this.timerInterval = null; }
+//     this.sessionDuration = '00:00:00';
 //   }
 
 //   private detectLanguageFrontend(text: string): 'es' | 'en' {
-//     const cleanText = text.toLowerCase().trim();
-//     if (/[áéíóúñ¿¡]/i.test(cleanText)) return 'es';
-//     const spanishPattern = /\b(de|del|el|la|los|las|un|una|está|están|son|es|como|qué|cómo|por|para|con|sin|pero|y|o|mi|tu|su|me|te|se|lo|le|ha|he|sido|sé|vamos|hacer|entonces|solo|más|nada|esto|no|que|muy|aquí|allí|bien|mal|todo|siempre|nunca|cuando|donde|mucho|poco|grande|nuevo|bueno|malo|si|sí|ver|ir|voy|va|hago|dice|ser|estar|tener|tengo|tiene|poder|puedo|querer|quiero|deber|debe|año|día|vez|cosa|gente|tiempo|vida|casa|ciudad|desde|hasta|otro|mismo|cada|todos|estamos)\b/gi;
-//     const words = cleanText.split(/\s+/).filter(w => w.length > 0);
-//     const spanishMatches = cleanText.match(spanishPattern);
-//     const spanishWordCount = spanishMatches ? spanishMatches.length : 0;
-//     const spanishRatio = words.length > 0 ? spanishWordCount / words.length : 0;
-//     if (words.length <= 5 && spanishWordCount >= 1) return 'es';
-//     if (spanishRatio >= 0.18) return 'es';
+//     const t = text.toLowerCase().trim();
+//     if (/[áéíóúñ¿¡]/i.test(t)) return 'es';
+//     if (/^(sí|si|no|ya|yo|mi|tu|su|lo|la|le|un|al|del|eh|ay|fue|hay|hoy|más|nos|eso|ese|esa|con|por|que|muy|son|han|van|voy|soy|da|ir)$/.test(t)) return 'es';
+//     if (/\b(de|del|el|la|los|las|un|una|está|son|es|por|para|con|pero|y|me|te|se|lo|le|sí|desde|hace|porque|cuando|tengo|tiene)\b/gi.test(t)) return 'es';
 //     return 'en';
 //   }
 
 //   addTranslation(text: string): void {
 //     const isSpanish = this.detectLanguageFrontend(text) === 'es';
 //     const translation = {
-//       original: text,
-//       translated: '',
+//       original: text, translated: '',
 //       sourceLang: isSpanish ? 'es' : 'en',
 //       targetLang: isSpanish ? 'en' : 'es',
 //       translating: true
@@ -849,77 +829,30 @@ ${textToTranslate}`
 //       let translated = '';
 //       let success = false;
 
-//       // 1. MyMemory — gratuito, sin API key, soporta es/en bien
 //       try {
-//         const langPair = `${translation.sourceLang}|${translation.targetLang}`;
-//         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${langPair}`;
+//         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${translation.sourceLang}|${translation.targetLang}`;
 //         const response = await fetch(url);
 //         if (response.ok) {
 //           const data = await response.json();
 //           if (data.responseStatus === 200 && data.responseData?.translatedText) {
 //             const t = data.responseData.translatedText;
-//             // MyMemory devuelve el texto original si no pudo traducir
-//             if (t && t !== textToTranslate && !t.toLowerCase().includes('mymemory')) {
-//               translated = t;
-//               success = true;
-//             }
+//             if (t && t !== textToTranslate && !t.toLowerCase().includes('mymemory')) { translated = t; success = true; }
 //           }
 //         }
-//       } catch { /* fallback */ }
+//       } catch { }
 
-//       // 2. Lingva (instancia pública de Google Translate sin API key)
 //       if (!success) {
 //         try {
-//           const src = translation.sourceLang;
-//           const tgt = translation.targetLang;
-//           const url = `https://lingva.ml/api/v1/${src}/${tgt}/${encodeURIComponent(textToTranslate)}`;
+//           const url = `https://lingva.ml/api/v1/${translation.sourceLang}/${translation.targetLang}/${encodeURIComponent(textToTranslate)}`;
 //           const response = await fetch(url);
-//           if (response.ok) {
-//             const data = await response.json();
-//             if (data.translation) {
-//               translated = data.translation;
-//               success = true;
-//             }
-//           }
-//         } catch { /* fallback */ }
+//           if (response.ok) { const data = await response.json(); if (data.translation) { translated = data.translation; success = true; } }
+//         } catch { }
 //       }
 
-//       // 3. Claude API como último recurso
-//       if (!success) {
-//         try {
-//           const targetName = translation.targetLang === 'es' ? 'Spanish' : 'English';
-//           const response = await fetch('https://api.anthropic.com/v1/messages', {
-//             method: 'POST',
-//             headers: { 'Content-Type': 'application/json' },
-//             body: JSON.stringify({
-//               model: 'claude-sonnet-4-20250514',
-//               max_tokens: 1000,
-//               messages: [{
-//                 role: 'user',
-//                 content: `Translate this text to ${targetName}. Reply with ONLY the translation, no explanation:
-
-// ${textToTranslate}`
-//               }]
-//             })
-//           });
-//           if (response.ok) {
-//             const data = await response.json();
-//             if (data.content?.[0]?.text) {
-//               translated = data.content[0].text.trim();
-//               success = true;
-//             }
-//           }
-//         } catch { /* todos los fallbacks fallaron */ }
-//       }
-
-//       if (success && translated) {
-//         translation.translated = translated;
-//       } else {
-//         translation.translated = '⚠️ Traducción no disponible';
-//       }
+//       translation.translated = success && translated ? translated : '⚠️ Traducción no disponible';
 //       translation.translating = false;
 //       this.cdr.detectChanges();
-//     } catch (error) {
+//     } catch {
 //       translation.translated = '⚠️ Error al traducir';
 //       translation.translating = false;
 //       this.cdr.detectChanges();
@@ -931,21 +864,14 @@ ${textToTranslate}`
 //     const selectedText = selection?.toString().trim();
 //     if (selectedText && selectedText.length > 0) {
 //       const textToTranslate = selectedText.length > 500 ? selectedText.substring(0, 500) : selectedText;
-//       if (selectedText.length > 500) {
-//         this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
-//       }
+//       if (selectedText.length > 500) this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
 //       this.addTranslation(textToTranslate);
 //       selection?.removeAllRanges();
 //     }
 //   }
 
 //   removeTranslation(index: number): void { this.translations.splice(index, 1); }
-
-//   clearAllTranslations(): void {
-//     this.translations = [];
-//     this.snackBar.open('🧹 Traducciones limpiadas', 'OK', { duration: 1500 });
-//   }
-
+//   clearAllTranslations(): void { this.translations = []; }
 //   toggleTranslationPanel(): void {}
 //   async translateSelection(): Promise<void> {}
 //   closeTranslation(): void {}
@@ -955,7 +881,6 @@ ${textToTranslate}`
 //   }
 
 //   ngOnDestroy() {
-//     this.stopSilenceTimer();
 //     this.stopTimer();
 //     if (this.chunkSubscription) this.chunkSubscription.unsubscribe();
 //     this.socket.disconnect();
@@ -976,868 +901,10 @@ ${textToTranslate}`
 //     return false;
 //   }
 
-//   onContainerScroll(event: Event): void {
+//   onContainerScroll(): void {
 //     this.autoScrollEnabled = this.isAtBottom();
 //   }
 // }
-// import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy, OnInit } from '@angular/core';
-// import { CommonModule } from '@angular/common';
-// import { AudioService } from './services/audio-service';
-// import { MatCardModule } from '@angular/material/card';
-// import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-// import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
-// import { MatButtonModule } from '@angular/material/button';
-// import { MatIconModule } from '@angular/material/icon';
-// import { io, Socket } from 'socket.io-client';
-// import { environment } from '../environments/environment';
-// import { Subscription } from 'rxjs';
-
-// @Component({
-//   selector: 'app-root',
-//   standalone: true,
-//   imports: [
-//     CommonModule,
-//     MatCardModule,
-//     MatButtonModule,
-//     MatSnackBarModule,
-//     MatProgressSpinnerModule,
-//     MatIconModule
-//   ],
-//   templateUrl: './app.html',
-//   styleUrls: ['./app.css']
-// })
-// export class App implements AfterViewChecked, OnDestroy {
-//   title = 'GetIntercall';
-//   isRecording = false;
-//   transcription = '';
-//   loading = false;
-
-//   // ── Cronómetro ───────────────────────────────────────────────────────────
-//   sessionDuration = '00:00:00';
-//   private timerInterval: any = null;
-//   private sessionStartTime = 0;
-
-//   @ViewChild('scrollMe', { static: false }) scrollMe!: ElementRef<HTMLDivElement>;
-
-//   private socket: Socket;
-//   private sessionId = '';
-
-//   private audioService = inject(AudioService);
-//   private cdr = inject(ChangeDetectorRef);
-//   private snackBar = inject(MatSnackBar);
-
-//   public currentPartial: { text: string; lang: string } = { text: '', lang: '' };
-//   bloques: { text: string; lang: string }[] = [];
-
-//   showTranslationPanel = true;
-
-//   translations: Array<{
-//     original: string;
-//     translated: string;
-//     sourceLang: string;
-//     targetLang: string;
-//     translating: boolean;
-//   }> = [];
-
-//   private silenceTimer: any = null;
-//   private readonly SILENCE_TIMEOUT_MS = 5000;
-//   private lastPartialTime = 0;
-//   private previousTranscriptionLength = 0;
-//   autoScrollEnabled = true;
-//   private chunkSubscription: Subscription | null = null;
-
-//   constructor() {
-//     this.socket = io(environment.apiUrl, {
-//       reconnection: true,
-//       reconnectionAttempts: Infinity,
-//       reconnectionDelay: 1000,
-//       reconnectionDelayMax: 5000,
-//       timeout: 20000,
-//     });
-
-//     this.socket.on('connect', () => {
-//       console.log('✅ Socket conectado a backend!');
-//     });
-
-//     this.socket.on('disconnect', () => {
-//       console.log('⚠️ Socket desconectado — reconectando...');
-//     });
-
-//     // Al reconectar durante una sesión activa, reiniciar la transcripción
-//     this.socket.on('reconnect', () => {
-//       console.log('✅ Socket reconectado');
-//       if (this.isRecording && this.sessionId) {
-//         console.log('🔄 Reiniciando sesión tras reconexión:', this.sessionId);
-//         this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-//         this.socket.emit('startTranscription', { sessionId: this.sessionId });
-//       }
-//     });
-
-//     this.socket.on('partialTranscript', (dataStr: string) => {
-//       try {
-//         const data = JSON.parse(dataStr);
-
-//         if (data.sessionId !== this.sessionId) return;
-//         if (!data.text?.trim()) return;
-
-//         const newText = data.text.trim();
-//         const detectedLang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
-
-//         this.lastPartialTime = Date.now();
-
-//         if (data.isNewTurn) {
-//           this.currentPartial = { text: '', lang: '' };
-
-//           const lastBlock = this.bloques[this.bloques.length - 1];
-//           const timeSinceLastBlock = Date.now() - (this as any)._lastBlockTime;
-//           const shouldMerge = lastBlock && timeSinceLastBlock < 8000;
-
-//           if (shouldMerge) {
-//             lastBlock.text += ' ' + newText;
-//           } else {
-//             this.bloques.push({ text: newText, lang: detectedLang });
-//           }
-//           (this as any)._lastBlockTime = Date.now();
-
-//         } else if (data.isNewBlock) {
-//           this.currentPartial = { text: newText, lang: detectedLang };
-
-//         } else {
-//           if (this.currentPartial.text) {
-//             this.currentPartial.text += ' ' + newText;
-//             const wordCount = this.currentPartial.text.split(/\s+/).filter(Boolean).length;
-//             if (wordCount < 5) this.currentPartial.lang = detectedLang;
-//           } else {
-//             this.currentPartial = { text: newText, lang: detectedLang };
-//           }
-//         }
-
-//         this.updateTranscription();
-
-//       } catch (e) {
-//         console.error('❌ Error parsing partialTranscript:', e, dataStr);
-//       }
-//     });
-
-//     this.socket.on('error', (err: any) => {
-//       this.snackBar.open(err.message || 'Error en backend', 'OK', { duration: 5000 });
-//     });
-
-//     this.socket.on('started', (data: any) => {
-//       console.log('✅ Real-time iniciado para session', data.sessionId);
-//       this.loading = false;
-//       this.startSilenceTimer();
-//     });
-
-//     this.socket.on('stopped', (data: any) => {
-//       console.log('🛑 Real-time detenido para session', data.sessionId);
-//       this.stopSilenceTimer();
-//       // Si aún estamos grabando (no se llamó stopRecording) — cerrar bloque pendiente
-//       // Si ya se llamó stopRecording, currentPartial ya está vacío — no hacer nada
-//       if (this.isRecording && this.currentPartial.text.trim()) {
-//         this.bloques.push({ ...this.currentPartial });
-//         this.currentPartial = { text: '', lang: '' };
-//         this.updateTranscription();
-//       }
-//     });
-//   }
-
-//   // ── Cronómetro ───────────────────────────────────────────────────────────
-//   private startTimer(): void {
-//     this.sessionStartTime = Date.now();
-//     this.sessionDuration = '00:00:00';
-//     this.timerInterval = setInterval(() => {
-//       const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
-//       const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-//       const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-//       const s = (elapsed % 60).toString().padStart(2, '0');
-//       this.sessionDuration = `${h}:${m}:${s}`;
-//       this.cdr.detectChanges();
-//     }, 1000);
-//   }
-
-//   private stopTimer(): void {
-//     if (this.timerInterval) {
-//       clearInterval(this.timerInterval);
-//       this.timerInterval = null;
-//     }
-//     this.sessionDuration = '00:00:00';
-//   }
-
-//   // ── Silence timer ────────────────────────────────────────────────────────
-//   private startSilenceTimer(): void {
-//     (this as any)._lastBlockTime = Date.now();
-//     this.silenceTimer = setInterval(() => {
-//       if (!this.isRecording) return;
-//       if (!this.currentPartial.text.trim()) return;
-
-//       const elapsed = Date.now() - this.lastPartialTime;
-//       if (elapsed > this.SILENCE_TIMEOUT_MS) {
-//         this.bloques.push({ ...this.currentPartial });
-//         (this as any)._lastBlockTime = Date.now();
-//         this.currentPartial = { text: '', lang: '' };
-//         this.lastPartialTime = Date.now();
-//         this.updateTranscription();
-//       }
-//     }, 500);
-//   }
-
-//   private stopSilenceTimer(): void {
-//     if (this.silenceTimer) {
-//       clearInterval(this.silenceTimer);
-//       this.silenceTimer = null;
-//     }
-//   }
-
-//   private updateTranscription(): void {
-//     const allBlocks = [...this.bloques];
-//     if (this.currentPartial.text.trim()) allBlocks.push(this.currentPartial);
-
-//     this.transcription = allBlocks
-//       .filter(b => b.text.trim())
-//       .map(b => b.text)
-//       .join('\n\n');
-
-//     this.cdr.detectChanges();
-
-//     if (this.transcription.length > this.previousTranscriptionLength) {
-//       setTimeout(() => this.scrollToBottom(), 100);
-//       this.previousTranscriptionLength = this.transcription.length;
-//     }
-//   }
-
-//   async startRecording() {
-//     try {
-//       await this.audioService.startTabAudioCapture();
-
-//       this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-
-//       this.isRecording = true;
-//       this.transcription = '';
-//       this.bloques = [];
-//       this.currentPartial = { text: '', lang: '' };
-//       this.lastPartialTime = Date.now();
-//       this.previousTranscriptionLength = 0;
-//       (this as any)._lastBlockTime = Date.now();
-//       this.loading = true;
-
-//       // FIX 3: Limpiar traducciones al iniciar nueva sesión
-//       this.translations = [];
-
-//       this.startTimer();
-
-//       this.snackBar.open('🎙️ Transcripción real-time iniciada...', 'OK', { duration: 3000 });
-//       this.socket.emit('startTranscription', { sessionId: this.sessionId });
-
-//       if (this.chunkSubscription) {
-//         this.chunkSubscription.unsubscribe();
-//         this.chunkSubscription = null;
-//       }
-
-//       this.chunkSubscription = this.audioService.chunk$.subscribe((buffer: ArrayBuffer) => {
-//         const uint8 = new Uint8Array(buffer);
-//         this.socket.emit('audioChunk', {
-//           sessionId: this.sessionId,
-//           chunk: Array.from(uint8)
-//         });
-//       });
-
-//     } catch (err: any) {
-//       console.error('❌ Error:', err);
-//       this.loading = false;
-//       this.isRecording = false;
-//       this.stopTimer();
-//       let msg = err.message || 'Error al iniciar captura.';
-//       if (err.name === 'NotSupportedError') msg = 'Screen capture no soportado. Usa Chrome + HTTPS.';
-//       if (err.name === 'NotAllowedError') msg = 'Permiso denegado. Marca "Compartir audio".';
-//       if (err.name === 'AbortError') msg = 'Captura cancelada. Selecciona pestaña con audio.';
-//       this.snackBar.open(msg, 'OK', { duration: 5000 });
-//     }
-//   }
-
-//   stopRecording() {
-//     this.socket.emit('stopTranscription', { sessionId: this.sessionId });
-//     this.audioService.stopRecording();
-//     this.isRecording = false;
-//     this.loading = false;
-//     this.stopSilenceTimer();
-//     this.stopTimer();
-
-//     if (this.chunkSubscription) {
-//       this.chunkSubscription.unsubscribe();
-//       this.chunkSubscription = null;
-//     }
-
-//     // Limpiar el bloque "en vivo" inmediatamente — sin esperar al evento 'stopped'
-//     this.currentPartial = { text: '', lang: '' };
-//     this.bloques = [];
-//     this.transcription = '';
-//     this.translations = [];
-//     this.previousTranscriptionLength = 0;
-//     this.cdr.detectChanges();
-
-//     this.snackBar.open('🛑 Transcripción detenida.', 'OK', { duration: 2000 });
-//   }
-
-//   // Limpia todo — transcripción + traducciones
-//   private clearAll(): void {
-//     this.transcription = '';
-//     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
-//     this.previousTranscriptionLength = 0;
-//     this.translations = [];
-//     this.cdr.detectChanges();
-//   }
-
-//   clearTranscription() {
-//     const wasEmpty = this.bloques.length === 0 && !this.currentPartial.text.trim();
-//     this.transcription = '';
-//     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
-//     this.previousTranscriptionLength = 0;
-//     this.cdr.detectChanges();
-//     if (!wasEmpty) {
-//       this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
-//     }
-//   }
-
-//   private detectLanguageFrontend(text: string): 'es' | 'en' {
-//     const cleanText = text.toLowerCase().trim();
-//     if (/[áéíóúñ¿¡]/i.test(cleanText)) return 'es';
-//     const spanishPattern = /\b(de|del|el|la|los|las|un|una|está|están|son|es|como|qué|cómo|por|para|con|sin|pero|y|o|mi|tu|su|me|te|se|lo|le|ha|he|sido|sé|vamos|hacer|entonces|solo|más|nada|esto|no|que|muy|aquí|allí|bien|mal|todo|siempre|nunca|cuando|donde|mucho|poco|grande|nuevo|bueno|malo|si|sí|ver|ir|voy|va|hago|dice|ser|estar|tener|tengo|tiene|poder|puedo|querer|quiero|deber|debe|año|día|vez|cosa|gente|tiempo|vida|casa|ciudad|desde|hasta|otro|mismo|cada|todos|estamos)\b/gi;
-//     const words = cleanText.split(/\s+/).filter(w => w.length > 0);
-//     const spanishMatches = cleanText.match(spanishPattern);
-//     const spanishWordCount = spanishMatches ? spanishMatches.length : 0;
-//     const spanishRatio = words.length > 0 ? spanishWordCount / words.length : 0;
-//     if (words.length <= 5 && spanishWordCount >= 1) return 'es';
-//     if (spanishRatio >= 0.18) return 'es';
-//     return 'en';
-//   }
-
-//   addTranslation(text: string): void {
-//     const isSpanish = this.detectLanguageFrontend(text) === 'es';
-//     const translation = {
-//       original: text,
-//       translated: '',
-//       sourceLang: isSpanish ? 'es' : 'en',
-//       targetLang: isSpanish ? 'en' : 'es',
-//       translating: true
-//     };
-//     this.translations.unshift(translation);
-//     this.translateItem(translation);
-//   }
-
-//   async translateItem(translation: any): Promise<void> {
-//     try {
-//       const textToTranslate = translation.original.length > 500
-//         ? translation.original.substring(0, 500) + '...'
-//         : translation.original;
-//       let translated = '';
-
-//       try {
-//         const response = await fetch('https://libretranslate.com/translate', {
-//           method: 'POST',
-//           headers: { 'Content-Type': 'application/json' },
-//           body: JSON.stringify({ q: textToTranslate, source: translation.sourceLang, target: translation.targetLang, format: 'text' })
-//         });
-//         if (response.ok) {
-//           const data = await response.json();
-//           translated = data.translatedText;
-//         } else throw new Error('LibreTranslate failed');
-//       } catch {
-//         const langPair = `${translation.sourceLang}|${translation.targetLang}`;
-//         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${langPair}`;
-//         const response = await fetch(url);
-//         if (!response.ok) throw new Error('MyMemory failed');
-//         const data = await response.json();
-//         if (data.responseStatus === 200 && data.responseData?.translatedText) {
-//           translated = data.responseData.translatedText;
-//         } else throw new Error('MyMemory invalid response');
-//       }
-
-//       translation.translated = translated;
-//       translation.translating = false;
-//       this.cdr.detectChanges();
-//     } catch (error) {
-//       translation.translated = 'Error: Servicio de traducción no disponible';
-//       translation.translating = false;
-//       this.cdr.detectChanges();
-//       this.snackBar.open('⚠️ Error al traducir.', 'OK', { duration: 3000 });
-//     }
-//   }
-
-//   onTextSelection(): void {
-//     const selection = window.getSelection();
-//     const selectedText = selection?.toString().trim();
-//     if (selectedText && selectedText.length > 0) {
-//       const textToTranslate = selectedText.length > 500 ? selectedText.substring(0, 500) : selectedText;
-//       if (selectedText.length > 500) {
-//         this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
-//       }
-//       this.addTranslation(textToTranslate);
-//       selection?.removeAllRanges();
-//     }
-//   }
-
-//   removeTranslation(index: number): void { this.translations.splice(index, 1); }
-
-//   clearAllTranslations(): void {
-//     this.translations = [];
-//     this.snackBar.open('🧹 Traducciones limpiadas', 'OK', { duration: 1500 });
-//   }
-
-//   toggleTranslationPanel(): void {}
-//   async translateSelection(): Promise<void> {}
-//   closeTranslation(): void {}
-
-//   ngAfterViewChecked(): void {
-//     if (this.transcription && this.autoScrollEnabled) this.scrollToBottom();
-//   }
-
-//   ngOnDestroy() {
-//     this.stopSilenceTimer();
-//     this.stopTimer();
-//     if (this.chunkSubscription) this.chunkSubscription.unsubscribe();
-//     this.socket.disconnect();
-//   }
-
-//   private scrollToBottom(): void {
-//     if (this.scrollMe && this.autoScrollEnabled) {
-//       const el = this.scrollMe.nativeElement;
-//       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-//     }
-//   }
-
-//   private isAtBottom(): boolean {
-//     if (this.scrollMe) {
-//       const el = this.scrollMe.nativeElement;
-//       return el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
-//     }
-//     return false;
-//   }
-
-//   onContainerScroll(event: Event): void {
-//     this.autoScrollEnabled = this.isAtBottom();
-//   }
-// }
-
-// import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy, OnInit } from '@angular/core';
-// import { CommonModule } from '@angular/common';
-// import { AudioService } from './services/audio-service';
-// import { MatCardModule } from '@angular/material/card';
-// import { MatSnackBar, MatSnackBarModule } from '@angular/material/snack-bar';
-// import { MatProgressSpinnerModule } from '@angular/material/progress-spinner';
-// import { MatButtonModule } from '@angular/material/button';
-// import { MatIconModule } from '@angular/material/icon';
-// import { io, Socket } from 'socket.io-client';
-// import { environment } from '../environments/environment';
-// import { Subscription } from 'rxjs';
-
-// @Component({
-//   selector: 'app-root',
-//   standalone: true,
-//   imports: [
-//     CommonModule,
-//     MatCardModule,
-//     MatButtonModule,
-//     MatSnackBarModule,
-//     MatProgressSpinnerModule,
-//     MatIconModule
-//   ],
-//   templateUrl: './app.html',
-//   styleUrls: ['./app.css']
-// })
-// export class App implements AfterViewChecked, OnDestroy {
-//   title = 'GetIntercall';
-//   isRecording = false;
-//   transcription = '';
-//   loading = false;
-
-//   // ── Cronómetro ───────────────────────────────────────────────────────────
-//   sessionDuration = '00:00:00';
-//   private timerInterval: any = null;
-//   private sessionStartTime = 0;
-
-//   @ViewChild('scrollMe', { static: false }) scrollMe!: ElementRef<HTMLDivElement>;
-
-//   private socket: Socket;
-//   private sessionId = '';
-
-//   private audioService = inject(AudioService);
-//   private cdr = inject(ChangeDetectorRef);
-//   private snackBar = inject(MatSnackBar);
-
-//   public currentPartial: { text: string; lang: string } = { text: '', lang: '' };
-//   bloques: { text: string; lang: string }[] = [];
-
-//   showTranslationPanel = true;
-
-//   translations: Array<{
-//     original: string;
-//     translated: string;
-//     sourceLang: string;
-//     targetLang: string;
-//     translating: boolean;
-//   }> = [];
-
-//   private silenceTimer: any = null;
-//   private readonly SILENCE_TIMEOUT_MS = 5000;
-//   private lastPartialTime = 0;
-//   private previousTranscriptionLength = 0;
-//   autoScrollEnabled = true;
-//   private chunkSubscription: Subscription | null = null;
-
-//   constructor() {
-//     this.socket = io(environment.apiUrl);
-
-//     this.socket.on('connect', () => {
-//       console.log('✅ Socket conectado a backend!');
-//     });
-
-//     this.socket.on('disconnect', () => {
-//       console.log('⚠️ Socket desconectado');
-//     });
-
-//     this.socket.on('partialTranscript', (dataStr: string) => {
-//       try {
-//         const data = JSON.parse(dataStr);
-
-//         if (data.sessionId !== this.sessionId) return;
-//         if (!data.text?.trim()) return;
-
-//         const newText = data.text.trim();
-//         const detectedLang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
-
-//         this.lastPartialTime = Date.now();
-
-//         if (data.isNewTurn) {
-//           this.currentPartial = { text: '', lang: '' };
-
-//           const lastBlock = this.bloques[this.bloques.length - 1];
-//           const timeSinceLastBlock = Date.now() - (this as any)._lastBlockTime;
-//           const shouldMerge = lastBlock && timeSinceLastBlock < 8000;
-
-//           if (shouldMerge) {
-//             lastBlock.text += ' ' + newText;
-//           } else {
-//             this.bloques.push({ text: newText, lang: detectedLang });
-//           }
-//           (this as any)._lastBlockTime = Date.now();
-
-//         } else if (data.isNewBlock) {
-//           this.currentPartial = { text: newText, lang: detectedLang };
-
-//         } else {
-//           if (this.currentPartial.text) {
-//             this.currentPartial.text += ' ' + newText;
-//             const wordCount = this.currentPartial.text.split(/\s+/).filter(Boolean).length;
-//             if (wordCount < 5) this.currentPartial.lang = detectedLang;
-//           } else {
-//             this.currentPartial = { text: newText, lang: detectedLang };
-//           }
-//         }
-
-//         this.updateTranscription();
-
-//       } catch (e) {
-//         console.error('❌ Error parsing partialTranscript:', e, dataStr);
-//       }
-//     });
-
-//     this.socket.on('error', (err: any) => {
-//       this.snackBar.open(err.message || 'Error en backend', 'OK', { duration: 5000 });
-//     });
-
-//     this.socket.on('started', (data: any) => {
-//       console.log('✅ Real-time iniciado para session', data.sessionId);
-//       this.loading = false;
-//       this.startSilenceTimer();
-//     });
-
-//     this.socket.on('stopped', (data: any) => {
-//       console.log('🛑 Real-time detenido para session', data.sessionId);
-//       this.stopSilenceTimer();
-//       if (this.currentPartial.text.trim()) {
-//         this.bloques.push({ ...this.currentPartial });
-//         this.currentPartial = { text: '', lang: '' };
-//         this.updateTranscription();
-//       }
-//     });
-//   }
-
-//   // ── Cronómetro ───────────────────────────────────────────────────────────
-//   private startTimer(): void {
-//     this.sessionStartTime = Date.now();
-//     this.sessionDuration = '00:00:00';
-//     this.timerInterval = setInterval(() => {
-//       const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
-//       const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
-//       const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
-//       const s = (elapsed % 60).toString().padStart(2, '0');
-//       this.sessionDuration = `${h}:${m}:${s}`;
-//       this.cdr.detectChanges();
-//     }, 1000);
-//   }
-
-//   private stopTimer(): void {
-//     if (this.timerInterval) {
-//       clearInterval(this.timerInterval);
-//       this.timerInterval = null;
-//     }
-//     this.sessionDuration = '00:00:00';
-//   }
-
-//   // ── Silence timer ────────────────────────────────────────────────────────
-//   private startSilenceTimer(): void {
-//     (this as any)._lastBlockTime = Date.now();
-//     this.silenceTimer = setInterval(() => {
-//       if (!this.isRecording) return;
-//       if (!this.currentPartial.text.trim()) return;
-
-//       const elapsed = Date.now() - this.lastPartialTime;
-//       if (elapsed > this.SILENCE_TIMEOUT_MS) {
-//         this.bloques.push({ ...this.currentPartial });
-//         (this as any)._lastBlockTime = Date.now();
-//         this.currentPartial = { text: '', lang: '' };
-//         this.lastPartialTime = Date.now();
-//         this.updateTranscription();
-//       }
-//     }, 500);
-//   }
-
-//   private stopSilenceTimer(): void {
-//     if (this.silenceTimer) {
-//       clearInterval(this.silenceTimer);
-//       this.silenceTimer = null;
-//     }
-//   }
-
-//   private updateTranscription(): void {
-//     const allBlocks = [...this.bloques];
-//     if (this.currentPartial.text.trim()) allBlocks.push(this.currentPartial);
-
-//     this.transcription = allBlocks
-//       .filter(b => b.text.trim())
-//       .map(b => b.text)
-//       .join('\n\n');
-
-//     this.cdr.detectChanges();
-
-//     if (this.transcription.length > this.previousTranscriptionLength) {
-//       setTimeout(() => this.scrollToBottom(), 100);
-//       this.previousTranscriptionLength = this.transcription.length;
-//     }
-//   }
-
-//   async startRecording() {
-//     try {
-//       await this.audioService.startTabAudioCapture();
-
-//       this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-
-//       this.isRecording = true;
-//       this.transcription = '';
-//       this.bloques = [];
-//       this.currentPartial = { text: '', lang: '' };
-//       this.lastPartialTime = Date.now();
-//       this.previousTranscriptionLength = 0;
-//       (this as any)._lastBlockTime = Date.now();
-//       this.loading = true;
-
-//       // FIX 3: Limpiar traducciones al iniciar nueva sesión
-//       this.translations = [];
-
-//       this.startTimer();
-
-//       this.snackBar.open('🎙️ Transcripción real-time iniciada...', 'OK', { duration: 3000 });
-//       this.socket.emit('startTranscription', { sessionId: this.sessionId });
-
-//       if (this.chunkSubscription) {
-//         this.chunkSubscription.unsubscribe();
-//         this.chunkSubscription = null;
-//       }
-
-//       this.chunkSubscription = this.audioService.chunk$.subscribe((buffer: ArrayBuffer) => {
-//         const uint8 = new Uint8Array(buffer);
-//         this.socket.emit('audioChunk', {
-//           sessionId: this.sessionId,
-//           chunk: Array.from(uint8)
-//         });
-//       });
-
-//     } catch (err: any) {
-//       console.error('❌ Error:', err);
-//       this.loading = false;
-//       this.isRecording = false;
-//       this.stopTimer();
-//       let msg = err.message || 'Error al iniciar captura.';
-//       if (err.name === 'NotSupportedError') msg = 'Screen capture no soportado. Usa Chrome + HTTPS.';
-//       if (err.name === 'NotAllowedError') msg = 'Permiso denegado. Marca "Compartir audio".';
-//       if (err.name === 'AbortError') msg = 'Captura cancelada. Selecciona pestaña con audio.';
-//       this.snackBar.open(msg, 'OK', { duration: 5000 });
-//     }
-//   }
-
-//   stopRecording() {
-//     this.socket.emit('stopTranscription', { sessionId: this.sessionId });
-//     this.audioService.stopRecording();
-//     this.isRecording = false;
-//     this.loading = false;
-//     this.stopSilenceTimer();
-//     this.stopTimer();
-
-//     if (this.chunkSubscription) {
-//       this.chunkSubscription.unsubscribe();
-//       this.chunkSubscription = null;
-//     }
-
-//     // FIX 3: Limpiar transcripción Y traducciones al detener
-//     this.clearAll();
-//     this.snackBar.open('🛑 Transcripción detenida.', 'OK', { duration: 2000 });
-//   }
-
-//   // Limpia todo — transcripción + traducciones
-//   private clearAll(): void {
-//     this.transcription = '';
-//     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
-//     this.previousTranscriptionLength = 0;
-//     this.translations = [];
-//     this.cdr.detectChanges();
-//   }
-
-//   clearTranscription() {
-//     const wasEmpty = this.bloques.length === 0 && !this.currentPartial.text.trim();
-//     this.transcription = '';
-//     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
-//     this.previousTranscriptionLength = 0;
-//     this.cdr.detectChanges();
-//     if (!wasEmpty) {
-//       this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
-//     }
-//   }
-
-//   private detectLanguageFrontend(text: string): 'es' | 'en' {
-//     const cleanText = text.toLowerCase().trim();
-//     if (/[áéíóúñ¿¡]/i.test(cleanText)) return 'es';
-//     const spanishPattern = /\b(de|del|el|la|los|las|un|una|está|están|son|es|como|qué|cómo|por|para|con|sin|pero|y|o|mi|tu|su|me|te|se|lo|le|ha|he|sido|sé|vamos|hacer|entonces|solo|más|nada|esto|no|que|muy|aquí|allí|bien|mal|todo|siempre|nunca|cuando|donde|mucho|poco|grande|nuevo|bueno|malo|si|sí|ver|ir|voy|va|hago|dice|ser|estar|tener|tengo|tiene|poder|puedo|querer|quiero|deber|debe|año|día|vez|cosa|gente|tiempo|vida|casa|ciudad|desde|hasta|otro|mismo|cada|todos|estamos)\b/gi;
-//     const words = cleanText.split(/\s+/).filter(w => w.length > 0);
-//     const spanishMatches = cleanText.match(spanishPattern);
-//     const spanishWordCount = spanishMatches ? spanishMatches.length : 0;
-//     const spanishRatio = words.length > 0 ? spanishWordCount / words.length : 0;
-//     if (words.length <= 5 && spanishWordCount >= 1) return 'es';
-//     if (spanishRatio >= 0.18) return 'es';
-//     return 'en';
-//   }
-
-//   addTranslation(text: string): void {
-//     const isSpanish = this.detectLanguageFrontend(text) === 'es';
-//     const translation = {
-//       original: text,
-//       translated: '',
-//       sourceLang: isSpanish ? 'es' : 'en',
-//       targetLang: isSpanish ? 'en' : 'es',
-//       translating: true
-//     };
-//     this.translations.unshift(translation);
-//     this.translateItem(translation);
-//   }
-
-//   async translateItem(translation: any): Promise<void> {
-//     try {
-//       const textToTranslate = translation.original.length > 500
-//         ? translation.original.substring(0, 500) + '...'
-//         : translation.original;
-//       let translated = '';
-
-//       try {
-//         const response = await fetch('https://libretranslate.com/translate', {
-//           method: 'POST',
-//           headers: { 'Content-Type': 'application/json' },
-//           body: JSON.stringify({ q: textToTranslate, source: translation.sourceLang, target: translation.targetLang, format: 'text' })
-//         });
-//         if (response.ok) {
-//           const data = await response.json();
-//           translated = data.translatedText;
-//         } else throw new Error('LibreTranslate failed');
-//       } catch {
-//         const langPair = `${translation.sourceLang}|${translation.targetLang}`;
-//         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${langPair}`;
-//         const response = await fetch(url);
-//         if (!response.ok) throw new Error('MyMemory failed');
-//         const data = await response.json();
-//         if (data.responseStatus === 200 && data.responseData?.translatedText) {
-//           translated = data.responseData.translatedText;
-//         } else throw new Error('MyMemory invalid response');
-//       }
-
-//       translation.translated = translated;
-//       translation.translating = false;
-//       this.cdr.detectChanges();
-//     } catch (error) {
-//       translation.translated = 'Error: Servicio de traducción no disponible';
-//       translation.translating = false;
-//       this.cdr.detectChanges();
-//       this.snackBar.open('⚠️ Error al traducir.', 'OK', { duration: 3000 });
-//     }
-//   }
-
-//   onTextSelection(): void {
-//     const selection = window.getSelection();
-//     const selectedText = selection?.toString().trim();
-//     if (selectedText && selectedText.length > 0) {
-//       const textToTranslate = selectedText.length > 500 ? selectedText.substring(0, 500) : selectedText;
-//       if (selectedText.length > 500) {
-//         this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
-//       }
-//       this.addTranslation(textToTranslate);
-//       selection?.removeAllRanges();
-//     }
-//   }
-
-//   removeTranslation(index: number): void { this.translations.splice(index, 1); }
-
-//   clearAllTranslations(): void {
-//     this.translations = [];
-//     this.snackBar.open('🧹 Traducciones limpiadas', 'OK', { duration: 1500 });
-//   }
-
-//   toggleTranslationPanel(): void {}
-//   async translateSelection(): Promise<void> {}
-//   closeTranslation(): void {}
-
-//   ngAfterViewChecked(): void {
-//     if (this.transcription && this.autoScrollEnabled) this.scrollToBottom();
-//   }
-
-//   ngOnDestroy() {
-//     this.stopSilenceTimer();
-//     this.stopTimer();
-//     if (this.chunkSubscription) this.chunkSubscription.unsubscribe();
-//     this.socket.disconnect();
-//   }
-
-//   private scrollToBottom(): void {
-//     if (this.scrollMe && this.autoScrollEnabled) {
-//       const el = this.scrollMe.nativeElement;
-//       el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
-//     }
-//   }
-
-//   private isAtBottom(): boolean {
-//     if (this.scrollMe) {
-//       const el = this.scrollMe.nativeElement;
-//       return el.scrollTop + el.clientHeight >= el.scrollHeight - 10;
-//     }
-//     return false;
-//   }
-
-//   onContainerScroll(event: Event): void {
-//     this.autoScrollEnabled = this.isAtBottom();
-//   }
-// }
-
 // import { Component, ViewChild, ElementRef, AfterViewChecked, ChangeDetectorRef, inject, OnDestroy } from '@angular/core';
 // import { CommonModule } from '@angular/common';
 // import { AudioService } from './services/audio-service';
@@ -1850,17 +917,12 @@ ${textToTranslate}`
 // import { environment } from '../environments/environment';
 // import { Subscription } from 'rxjs';
 
+// interface Bloque { text: string; lang: string; }
+
 // @Component({
 //   selector: 'app-root',
 //   standalone: true,
-//   imports: [
-//     CommonModule,
-//     MatCardModule,
-//     MatButtonModule,
-//     MatSnackBarModule,
-//     MatProgressSpinnerModule,
-//     MatIconModule
-//   ],
+//   imports: [CommonModule, MatCardModule, MatButtonModule, MatSnackBarModule, MatProgressSpinnerModule, MatIconModule],
 //   templateUrl: './app.html',
 //   styleUrls: ['./app.css']
 // })
@@ -1870,95 +932,164 @@ ${textToTranslate}`
 //   transcription = '';
 //   loading = false;
 
+//   sessionDuration = '00:00:00';
+//   private timerInterval: any = null;
+//   private sessionStartTime = 0;
+
 //   @ViewChild('scrollMe', { static: false }) scrollMe!: ElementRef<HTMLDivElement>;
 
 //   private socket: Socket;
-
-//   // ✅ sessionId se regenera en cada startRecording() para evitar colisiones
-//   // entre sesiones del mismo usuario o múltiples intérpretes simultáneos
 //   private sessionId = '';
-
 //   private audioService = inject(AudioService);
 //   private cdr = inject(ChangeDetectorRef);
 //   private snackBar = inject(MatSnackBar);
 
-//   public currentPartial: { text: string; lang: string } = { text: '', lang: '' };
-//   bloques: { text: string; lang: string }[] = [];
+//   // ── Estado de transcripción ───────────────────────────────────────────────
+//   partialEn: Bloque = { text: '', lang: 'en' };
+//   partialEs: Bloque = { text: '', lang: 'es' };
+//   private partialEnTs = 0;  // timestamp del último update
+//   private partialEsTs = 0;
+//   private lastBlockEnTs = 0; // timestamp del último bloque definitivo EN
+//   private lastBlockEsTs = 0; // timestamp del último bloque definitivo ES
+//   bloques: Bloque[] = [];
 
+//   // Panel de traducción
 //   showTranslationPanel = true;
 //   translations: Array<{
-//     original: string;
-//     translated: string;
-//     sourceLang: string;
-//     targetLang: string;
-//     translating: boolean;
+//     original: string; translated: string;
+//     sourceLang: string; targetLang: string; translating: boolean;
 //   }> = [];
 
-//   private silenceTimer: any = null;
-
-//   // Timer de seguridad en frontend: si pasan 2.5s sin partials, cerrar bloque
-//   // Debe estar alineado con FORCE_CLOSE_AFTER_MS del backend
-//   private readonly SILENCE_TIMEOUT_MS = 2500;
-
-//   private lastPartialTime = 0;
-//   private previousTranscriptionLength = 0;
 //   autoScrollEnabled = true;
+//   private previousTranscriptionLength = 0;
 //   private chunkSubscription: Subscription | null = null;
 
 //   constructor() {
-//     this.socket = io(environment.apiUrl);
-
-//     this.socket.on('connect', () => {
-//       console.log('✅ Socket conectado a backend!');
+//     this.socket = io(environment.apiUrl, {
+//       reconnection: true,
+//       reconnectionAttempts: Infinity,
+//       reconnectionDelay: 1000,
+//       reconnectionDelayMax: 5000,
+//       timeout: 20000,
 //     });
 
-//     this.socket.on('disconnect', () => {
-//       console.log('⚠️ Socket desconectado');
+//     this.socket.on('connect', () => console.log('✅ Socket conectado'));
+//     this.socket.on('disconnect', () => console.log('⚠️ Socket desconectado'));
+//     this.socket.on('reconnect', () => {
+//       if (this.isRecording && this.sessionId) {
+//         this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+//         this.socket.emit('startTranscription', { sessionId: this.sessionId });
+//       }
 //     });
 
 //     this.socket.on('partialTranscript', (dataStr: string) => {
 //       try {
 //         const data = JSON.parse(dataStr);
-
-//         // Ignorar mensajes de otras sesiones (importante con sessionId único)
 //         if (data.sessionId !== this.sessionId) return;
 //         if (!data.text?.trim()) return;
 
-//         const newText = data.text.trim();
-//         const detectedLang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
+//         const text = data.text.trim();
+//         const lang: 'es' | 'en' = data.language === 'es' ? 'es' : 'en';
 
-//         this.lastPartialTime = Date.now();
-
-//         if (data.isNewTurn) {
-//           // ── BLOQUE DEFINITIVO ────────────────────────────────────────────
-//           // El backend envía el texto COMPLETO del turno finalizado.
-//           // Descartamos el partial acumulado en frontend (el backend ya lo tiene correcto).
-//           this.currentPartial = { text: '', lang: '' };
-//           this.bloques.push({ text: newText, lang: detectedLang });
-//           console.log(`✅ BLOQUE FINAL #${this.bloques.length} [${detectedLang}]: "${newText.substring(0, 80)}"`);
-
-//         } else if (data.isNewBlock) {
-//           // ── NUEVO BLOQUE tras reformulación de AssemblyAI ────────────────
-//           // El backend ya cerró el bloque anterior. Iniciar uno nuevo.
-//           this.currentPartial = { text: newText, lang: detectedLang };
-//           console.log(`🆕 NUEVO BLOQUE [${detectedLang}]: "${newText.substring(0, 60)}"`);
-
-//         } else {
-//           // ── PARTIAL: Acumular en el bloque actual ────────────────────────
-//           if (this.currentPartial.text) {
-//             this.currentPartial.text += ' ' + newText;
-//             // Corregir idioma en los primeros tokens (AssemblyAI puede tardar en detectar)
-//             const wordCount = this.currentPartial.text.split(/\s+/).filter(Boolean).length;
-//             if (wordCount < 5) {
-//               this.currentPartial.lang = detectedLang;
+//         // ── CORRECCIÓN: actualizar el último bloque del mismo idioma ─────────
+//         if (data.isCorrection) {
+//           // Buscar el último bloque del mismo idioma y actualizarlo
+//           for (let i = this.bloques.length - 1; i >= 0; i--) {
+//             if (this.bloques[i].lang === lang) {
+//               this.bloques[i] = { text, lang };
+//               console.log(`✨ Corrección [${lang}]:`, text.substring(0, 50));
+//               break;
 //             }
-//           } else {
-//             this.currentPartial = { text: newText, lang: detectedLang };
 //           }
-//           console.log(`📝 PARTIAL [${detectedLang}]: "${this.currentPartial.text.substring(0, 80)}"`);
+//           this.render();
+//           return;
 //         }
 
-//         this.updateTranscription();
+//         // ── NUEVO TURNO: bloque definitivo del backend ───────────────────────
+//         if (data.isNewTurn || data.isForcedClose) {
+//           // Limpiar partial de este idioma y resetear su timestamp
+//           // Guardar timestamp de cuándo se fijó este bloque para ignorar ecos tardíos
+//           if (lang === 'en') {
+//             this.partialEn = { text: '', lang: 'en' };
+//             this.partialEnTs = 0;
+//             this.lastBlockEnTs = Date.now();
+//           } else {
+//             this.partialEs = { text: '', lang: 'es' };
+//             this.partialEsTs = 0;
+//             this.lastBlockEsTs = Date.now();
+//           }
+
+//           // Dedup: si el último bloque del mismo idioma cerrado hace <3s es
+//           // prefijo del nuevo texto (buffer reabierto y extendido), reemplazar en vez de añadir.
+//           const norm = (s: string) => s.toLowerCase().replace(/[.,?!¿¡]/g,'').replace(/\s+/g,' ').trim();
+//           const normNew = norm(text);
+//           const lastSameIdx = (() => {
+//             for (let i = this.bloques.length - 1; i >= 0; i--) {
+//               if (this.bloques[i].lang === lang) return i;
+//             }
+//             return -1;
+//           })();
+//           const msSinceBlock = lang === 'en' ? Date.now() - this.lastBlockEnTs : Date.now() - this.lastBlockEsTs;
+//           if (lastSameIdx >= 0 && msSinceBlock < 3000) {
+//             const normPrev = norm(this.bloques[lastSameIdx].text);
+//             const isExtension = normNew.startsWith(normPrev.substring(0, Math.min(20, normPrev.length)))
+//               && normNew.length > normPrev.length;
+//             const isDuplicate = normNew === normPrev
+//               || normPrev.startsWith(normNew.substring(0, Math.min(20, normNew.length)));
+//             if (isExtension) {
+//               this.bloques[lastSameIdx] = { text, lang };
+//               console.log(`🔄 Bloque extendido [${lang}]:`, text.substring(0, 60));
+//               this.render();
+//               return;
+//             }
+//             if (isDuplicate) {
+//               console.log(`🔇 Bloque duplicado [${lang}] ignorado:`, text.substring(0, 60));
+//               this.render();
+//               return;
+//             }
+//           }
+//           this.bloques.push({ text, lang });
+//           console.log(`✅ Bloque [${lang}]:`, text.substring(0, 60));
+//           this.render();
+//           return;
+//         }
+
+//         // ── PARTIAL: preview en vivo ────────────────────────────────────────
+//         const now = Date.now();
+
+//         // Ignorar partials que llegan dentro de 800ms después de fijar un bloque del mismo idioma
+//         // (eco tardío de Deepgram que puede reformular incorrectamente el backchannel)
+//         const lastBlockTs = lang === 'en' ? this.lastBlockEnTs : this.lastBlockEsTs;
+//         if (now - lastBlockTs < 400) {
+//           console.log(`🔇 Partial [${lang}] ignorado (eco post-bloque):`, text.substring(0, 40));
+//           return;
+//         }
+
+//         if (lang === 'en') {
+//           // Anti-regresión: si Deepgram reformuló a algo más corto, mantener el más largo
+//           const currentEn = this.partialEn.text;
+//           if (!currentEn || text.length >= currentEn.length * 0.7 || text.length > currentEn.length) {
+//             this.partialEn = { text, lang: 'en' };
+//           }
+//           this.partialEnTs = now;
+//           // Si el partial ES lleva >2.5s sin actualizarse, limpiarlo (stale)
+//           if (this.partialEs.text && now - this.partialEsTs > 2500) {
+//             this.partialEs = { text: '', lang: 'es' };
+//           }
+//         } else {
+//           const currentEs = this.partialEs.text;
+//           if (!currentEs || text.length >= currentEs.length * 0.7 || text.length > currentEs.length) {
+//             this.partialEs = { text, lang: 'es' };
+//           }
+//           this.partialEsTs = now;
+//           // Si el partial EN lleva >2.5s sin actualizarse, limpiarlo (stale)
+//           if (this.partialEn.text && now - this.partialEnTs > 2500) {
+//             this.partialEn = { text: '', lang: 'en' };
+//           }
+//         }
+
+//         console.log(`📝 Partial [${lang}]:`, text.substring(0, 50));
+//         this.render();
 
 //       } catch (e) {
 //         console.error('❌ Error parsing partialTranscript:', e, dataStr);
@@ -1966,108 +1097,89 @@ ${textToTranslate}`
 //     });
 
 //     this.socket.on('error', (err: any) => {
-//       console.error('❌ WS error:', err);
 //       this.snackBar.open(err.message || 'Error en backend', 'OK', { duration: 5000 });
 //     });
 
-//     this.socket.on('started', (data: any) => {
-//       console.log('✅ Real-time iniciado para session', data.sessionId);
+//     this.socket.on('started', () => {
 //       this.loading = false;
-//       this.startSilenceTimer();
 //     });
 
-//     this.socket.on('stopped', (data: any) => {
-//       console.log('🛑 Real-time detenido para session', data.sessionId);
-//       this.stopSilenceTimer();
-//       // Finalizar partial pendiente si quedó algo
-//       if (this.currentPartial.text.trim()) {
-//         this.bloques.push({ ...this.currentPartial });
-//         this.currentPartial = { text: '', lang: '' };
-//         this.updateTranscription();
+//     this.socket.on('stopped', () => {
+//       // Vaciar partials pendientes como bloques al detener
+//       if (this.partialEn.text.trim()) {
+//         this.bloques.push({ ...this.partialEn });
+//         this.partialEn = { text: '', lang: 'en' };
 //       }
+//       if (this.partialEs.text.trim()) {
+//         this.bloques.push({ ...this.partialEs });
+//         this.partialEs = { text: '', lang: 'es' };
+//       }
+//       this.render();
 //     });
 //   }
 
-//   // Timer de seguridad en frontend: tercer nivel de cierre de bloques
-//   private startSilenceTimer(): void {
-//     this.silenceTimer = setInterval(() => {
-//       if (!this.isRecording) return;
-//       if (!this.currentPartial.text.trim()) return;
+//   // ── render: reconstruir transcription desde bloques + partials ────────────
+//   private render(): void {
+//     // Mostrar bloques definitivos + cualquier partial activo intercalado
+//     const toShow: Bloque[] = [...this.bloques];
 
-//       const elapsed = Date.now() - this.lastPartialTime;
-//       if (elapsed > this.SILENCE_TIMEOUT_MS) {
-//         console.log(`⏱️ Frontend silence timer: cerrando bloque tras ${elapsed}ms`);
-//         this.bloques.push({ ...this.currentPartial });
-//         this.currentPartial = { text: '', lang: '' };
-//         this.lastPartialTime = Date.now();
-//         this.updateTranscription();
-//       }
-//     }, 300);
-//   }
+//     // Los partials se muestran como el último elemento de su idioma
+//     // Si hay partial EN, reemplazar el último bloque EN en display (no en bloques[])
+//     // Para simplificar: los partials se muestran DESPUÉS de los bloques
 
-//   private stopSilenceTimer(): void {
-//     if (this.silenceTimer) {
-//       clearInterval(this.silenceTimer);
-//       this.silenceTimer = null;
-//     }
-//   }
-
-//   private updateTranscription(): void {
-//     const allBlocks = [...this.bloques];
-//     if (this.currentPartial.text.trim()) allBlocks.push(this.currentPartial);
-
-//     this.transcription = allBlocks
+//     this.transcription = toShow
 //       .filter(b => b.text.trim())
-//       .map(b => `[${b.lang.toUpperCase()}] ${b.text}`)
+//       .map(b => b.text)
 //       .join('\n\n');
 
 //     this.cdr.detectChanges();
 
 //     if (this.transcription.length > this.previousTranscriptionLength) {
-//       setTimeout(() => this.scrollToBottom(), 100);
+//       setTimeout(() => this.scrollToBottom(), 50);
 //       this.previousTranscriptionLength = this.transcription.length;
 //     }
 //   }
 
+//   // ── Computed: partial activo a mostrar (el más reciente) ─────────────────
+//   get activePartial(): Bloque | null {
+//     // Si hay dos partials activos, mostrar el más largo (más informativo)
+//     const hasEn = this.partialEn.text.trim().length > 0;
+//     const hasEs = this.partialEs.text.trim().length > 0;
+//     if (!hasEn && !hasEs) return null;
+//     if (hasEn && !hasEs) return this.partialEn;
+//     if (!hasEn && hasEs) return this.partialEs;
+//     // Ambos activos: mostrar el más largo
+//     return this.partialEn.text.length >= this.partialEs.text.length
+//       ? this.partialEn : this.partialEs;
+//   }
+
+//   // ── Grabación ────────────────────────────────────────────────────────────
+
 //   async startRecording() {
 //     try {
 //       await this.audioService.startTabAudioCapture();
-
-//       // ✅ Nuevo sessionId en cada grabación — evita colisiones entre sesiones
 //       this.sessionId = `${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
-//       console.log('🆔 Nueva sesión:', this.sessionId);
-
 //       this.isRecording = true;
 //       this.transcription = '';
 //       this.bloques = [];
-//       this.currentPartial = { text: '', lang: '' };
-//       this.lastPartialTime = Date.now();
+//       this.partialEn = { text: '', lang: 'en' };
+//       this.partialEs = { text: '', lang: 'es' };
 //       this.previousTranscriptionLength = 0;
 //       this.loading = true;
-
+//       this.translations = [];
+//       this.startTimer();
 //       this.snackBar.open('🎙️ Transcripción real-time iniciada...', 'OK', { duration: 3000 });
-
 //       this.socket.emit('startTranscription', { sessionId: this.sessionId });
-//       console.log('📤 startTranscription emitido para session', this.sessionId);
 
-//       // Cancelar suscripción anterior y resuscribirse al nuevo chunk$
-//       if (this.chunkSubscription) {
-//         this.chunkSubscription.unsubscribe();
-//         this.chunkSubscription = null;
-//       }
-
+//       if (this.chunkSubscription) { this.chunkSubscription.unsubscribe(); this.chunkSubscription = null; }
 //       this.chunkSubscription = this.audioService.chunk$.subscribe((buffer: ArrayBuffer) => {
 //         const uint8 = new Uint8Array(buffer);
-//         this.socket.emit('audioChunk', {
-//           sessionId: this.sessionId,
-//           chunk: Array.from(uint8)
-//         });
+//         this.socket.emit('audioChunk', { sessionId: this.sessionId, chunk: Array.from(uint8) });
 //       });
-
 //     } catch (err: any) {
-//       console.error('❌ Error:', err);
 //       this.loading = false;
 //       this.isRecording = false;
+//       this.stopTimer();
 //       let msg = err.message || 'Error al iniciar captura.';
 //       if (err.name === 'NotSupportedError') msg = 'Screen capture no soportado. Usa Chrome + HTTPS.';
 //       if (err.name === 'NotAllowedError') msg = 'Permiso denegado. Marca "Compartir audio".';
@@ -2081,49 +1193,63 @@ ${textToTranslate}`
 //     this.audioService.stopRecording();
 //     this.isRecording = false;
 //     this.loading = false;
-//     this.stopSilenceTimer();
-
-//     if (this.chunkSubscription) {
-//       this.chunkSubscription.unsubscribe();
-//       this.chunkSubscription = null;
-//     }
-
-//     this.clearTranscription();
+//     this.stopTimer();
+//     if (this.chunkSubscription) { this.chunkSubscription.unsubscribe(); this.chunkSubscription = null; }
+//     this.partialEn = { text: '', lang: 'en' };
+//     this.partialEs = { text: '', lang: 'es' };
+//     this.bloques = [];
+//     this.transcription = '';
+//     this.translations = [];
+//     this.previousTranscriptionLength = 0;
+//     this.cdr.detectChanges();
 //     this.snackBar.open('🛑 Transcripción detenida.', 'OK', { duration: 2000 });
 //   }
 
 //   clearTranscription() {
-//     const wasEmpty = this.bloques.length === 0 && !this.currentPartial.text.trim();
+//     const wasEmpty = this.bloques.length === 0 && !this.partialEn.text && !this.partialEs.text;
 //     this.transcription = '';
 //     this.bloques = [];
-//     this.currentPartial = { text: '', lang: '' };
+//     this.partialEn = { text: '', lang: 'en' };
+//     this.partialEs = { text: '', lang: 'es' };
 //     this.previousTranscriptionLength = 0;
 //     this.cdr.detectChanges();
-//     if (!wasEmpty) {
-//       this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
-//     }
+//     if (!wasEmpty) this.snackBar.open('🧹 Transcripción limpiada', 'OK', { duration: 1500 });
 //   }
 
-//   // ── Detección de idioma (fallback si backend no envía language) ──────────
+//   // ── Timers ────────────────────────────────────────────────────────────────
+
+//   private startTimer(): void {
+//     this.sessionStartTime = Date.now();
+//     this.sessionDuration = '00:00:00';
+//     this.timerInterval = setInterval(() => {
+//       const elapsed = Math.floor((Date.now() - this.sessionStartTime) / 1000);
+//       const h = Math.floor(elapsed / 3600).toString().padStart(2, '0');
+//       const m = Math.floor((elapsed % 3600) / 60).toString().padStart(2, '0');
+//       const s = (elapsed % 60).toString().padStart(2, '0');
+//       this.sessionDuration = `${h}:${m}:${s}`;
+//       this.cdr.detectChanges();
+//     }, 1000);
+//   }
+
+//   private stopTimer(): void {
+//     if (this.timerInterval) { clearInterval(this.timerInterval); this.timerInterval = null; }
+//     this.sessionDuration = '00:00:00';
+//   }
+
+//   // ── Traducción ────────────────────────────────────────────────────────────
+
 //   private detectLanguageFrontend(text: string): 'es' | 'en' {
-//     const cleanText = text.toLowerCase().trim();
-//     if (/[áéíóúñ¿¡]/i.test(cleanText)) return 'es';
-//     const spanishPattern = /\b(de|del|el|la|los|las|un|una|está|están|son|es|como|qué|cómo|por|para|con|sin|pero|y|o|mi|tu|su|me|te|se|lo|le|ha|he|sido|sé|vamos|hacer|entonces|solo|más|nada|esto|no|que|muy|aquí|allí|bien|mal|todo|siempre|nunca|cuando|donde|mucho|poco|grande|nuevo|bueno|malo|si|sí|ver|ir|voy|va|hago|dice|ser|estar|tener|tengo|tiene|poder|puedo|querer|quiero|deber|debe|año|día|vez|cosa|gente|tiempo|vida|casa|ciudad|desde|hasta|otro|mismo|cada|todos|estamos)\b/gi;
-//     const words = cleanText.split(/\s+/).filter(w => w.length > 0);
-//     const spanishMatches = cleanText.match(spanishPattern);
-//     const spanishWordCount = spanishMatches ? spanishMatches.length : 0;
-//     const spanishRatio = words.length > 0 ? spanishWordCount / words.length : 0;
-//     if (words.length <= 5 && spanishWordCount >= 1) return 'es';
-//     if (spanishRatio >= 0.18) return 'es';
+//     const t = text.toLowerCase().trim();
+//     if (/[áéíóúñ¿¡]/i.test(t)) return 'es';
+//     if (/^(sí|si|no|ya|yo|mi|tu|su|lo|la|le|un|al|del|eh|ay|fue|hay|hoy|más|nos|eso|ese|esa|con|por|que|muy|son|han|van|voy|soy|da|ir)$/.test(t)) return 'es';
+//     if (/\b(de|del|el|la|los|las|un|una|está|son|es|por|para|con|pero|y|me|te|se|lo|le|sí|desde|hace|porque|cuando|tengo|tiene)\b/gi.test(t)) return 'es';
 //     return 'en';
 //   }
 
-//   // ── Traducciones ─────────────────────────────────────────────────────────
 //   addTranslation(text: string): void {
 //     const isSpanish = this.detectLanguageFrontend(text) === 'es';
 //     const translation = {
-//       original: text,
-//       translated: '',
+//       original: text, translated: '',
 //       sourceLang: isSpanish ? 'es' : 'en',
 //       targetLang: isSpanish ? 'en' : 'es',
 //       translating: true
@@ -2138,42 +1264,35 @@ ${textToTranslate}`
 //         ? translation.original.substring(0, 500) + '...'
 //         : translation.original;
 //       let translated = '';
+//       let success = false;
 
 //       try {
-//         const response = await fetch('https://libretranslate.com/translate', {
-//           method: 'POST',
-//           headers: { 'Content-Type': 'application/json' },
-//           body: JSON.stringify({
-//             q: textToTranslate,
-//             source: translation.sourceLang,
-//             target: translation.targetLang,
-//             format: 'text'
-//           })
-//         });
+//         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${translation.sourceLang}|${translation.targetLang}`;
+//         const response = await fetch(url);
 //         if (response.ok) {
 //           const data = await response.json();
-//           translated = data.translatedText;
-//         } else throw new Error('LibreTranslate failed');
-//       } catch {
-//         const langPair = `${translation.sourceLang}|${translation.targetLang}`;
-//         const url = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=${langPair}`;
-//         const response = await fetch(url);
-//         if (!response.ok) throw new Error('MyMemory failed');
-//         const data = await response.json();
-//         if (data.responseStatus === 200 && data.responseData?.translatedText) {
-//           translated = data.responseData.translatedText;
-//         } else throw new Error('MyMemory invalid response');
+//           if (data.responseStatus === 200 && data.responseData?.translatedText) {
+//             const t = data.responseData.translatedText;
+//             if (t && t !== textToTranslate && !t.toLowerCase().includes('mymemory')) { translated = t; success = true; }
+//           }
+//         }
+//       } catch { }
+
+//       if (!success) {
+//         try {
+//           const url = `https://lingva.ml/api/v1/${translation.sourceLang}/${translation.targetLang}/${encodeURIComponent(textToTranslate)}`;
+//           const response = await fetch(url);
+//           if (response.ok) { const data = await response.json(); if (data.translation) { translated = data.translation; success = true; } }
+//         } catch { }
 //       }
 
-//       translation.translated = translated;
+//       translation.translated = success && translated ? translated : '⚠️ Traducción no disponible';
 //       translation.translating = false;
 //       this.cdr.detectChanges();
-//     } catch (error) {
-//       console.error('❌ Translation error:', error);
-//       translation.translated = 'Error: Servicio de traducción no disponible';
+//     } catch {
+//       translation.translated = '⚠️ Error al traducir';
 //       translation.translating = false;
 //       this.cdr.detectChanges();
-//       this.snackBar.open('⚠️ Error al traducir.', 'OK', { duration: 3000 });
 //     }
 //   }
 
@@ -2182,30 +1301,26 @@ ${textToTranslate}`
 //     const selectedText = selection?.toString().trim();
 //     if (selectedText && selectedText.length > 0) {
 //       const textToTranslate = selectedText.length > 500 ? selectedText.substring(0, 500) : selectedText;
-//       if (selectedText.length > 500) {
-//         this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
-//       }
+//       if (selectedText.length > 500) this.snackBar.open('⚠️ Texto truncado a 500 caracteres', 'OK', { duration: 2000 });
 //       this.addTranslation(textToTranslate);
 //       selection?.removeAllRanges();
 //     }
 //   }
 
 //   removeTranslation(index: number): void { this.translations.splice(index, 1); }
-//   clearAllTranslations(): void {
-//     this.translations = [];
-//     this.snackBar.open('🧹 Traducciones limpiadas', 'OK', { duration: 1500 });
-//   }
-//   toggleTranslationPanel(): void { this.showTranslationPanel = !this.showTranslationPanel; }
+//   clearAllTranslations(): void { this.translations = []; }
+//   toggleTranslationPanel(): void {}
 //   async translateSelection(): Promise<void> {}
 //   closeTranslation(): void {}
 
-//   // ── Scroll ───────────────────────────────────────────────────────────────
+//   // ── Scroll ────────────────────────────────────────────────────────────────
+
 //   ngAfterViewChecked(): void {
 //     if (this.transcription && this.autoScrollEnabled) this.scrollToBottom();
 //   }
 
 //   ngOnDestroy() {
-//     this.stopSilenceTimer();
+//     this.stopTimer();
 //     if (this.chunkSubscription) this.chunkSubscription.unsubscribe();
 //     this.socket.disconnect();
 //   }
@@ -2225,7 +1340,8 @@ ${textToTranslate}`
 //     return false;
 //   }
 
-//   onContainerScroll(event: Event): void {
+//   onContainerScroll(): void {
 //     this.autoScrollEnabled = this.isAtBottom();
 //   }
 // }
+

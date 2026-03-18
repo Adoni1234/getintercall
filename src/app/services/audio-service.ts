@@ -15,17 +15,15 @@ export class AudioService {
   private chunkSubject = new Subject<ArrayBuffer>();
   chunk$ = this.chunkSubject.asObservable();
 
-  private pcmBuffer = new Int16Array(800); // 50ms a 16kHz
+  // 1600 samples = 100ms @ 16kHz — tamaño estable para AssemblyAI v3
+  private pcmBuffer = new Int16Array(1600);
   private bufferIndex = 0;
   private chunksReceived = 0;
-  private lastVoiceTime = 0;
-  private readonly SILENCE_LOG_THRESHOLD = 3000;
 
   async startTabAudioCapture() {
     this.chunkSubject = new Subject<ArrayBuffer>();
     this.chunk$ = this.chunkSubject.asObservable();
 
-    console.log('Abriendo selector de pestaña...');
     let stream: MediaStream;
 
     try {
@@ -38,55 +36,83 @@ export class AudioService {
           sampleRate: 16000,
         } as any,
       });
-      console.log('✅ Stream capturado');
+
       stream.getVideoTracks().forEach(track => track.enabled = false);
     } catch (err: any) {
       throw new Error(`Screen capture falló: ${err.name}. Usa Chrome + HTTPS.`);
     }
 
     if (stream.getAudioTracks().length === 0) {
-      throw new Error('Stream sin audio tracks — marca "Compartir audio" en el diálogo');
+      throw new Error('Stream sin audio tracks — marca "Compartir audio"');
     }
-
-    const audioTrack = stream.getAudioTracks()[0];
-    const settings = audioTrack.getSettings();
-    console.log(`🎤 Audio track: sampleRate=${settings.sampleRate}, channels=${settings.channelCount}`);
 
     this.audioContext = new AudioContext({ sampleRate: 16000 });
     this.source = this.audioContext.createMediaStreamSource(stream);
 
-    // Gain x12 — audio de pestaña del navegador viene muy bajo (-50 a -80dB)
-    // Necesita boost agresivo para que AssemblyAI detecte voz
+    // Gain bajo (2) para no saturar antes del compresor.
+    // La amplificación real se hace en el AudioWorklet con normalización per-chunk.
     this.gainNode = this.audioContext.createGain();
-    this.gainNode.gain.value = 12;
+    this.gainNode.gain.value = 2;
 
-    // Compresor más agresivo para normalizar dinámicas
+    // Compresor solo como limitador de picos — NO como amplificador.
+    // threshold alto (-20dB): solo actúa en picos muy fuertes.
+    // ratio bajo (3): compresión suave sin matar voces débiles.
+    // release rápido (0.05s): se recupera antes del siguiente hablante.
     this.compressor = this.audioContext.createDynamicsCompressor();
-    this.compressor.threshold.value = -30;
-    this.compressor.knee.value = 6;
-    this.compressor.ratio.value = 8;
+    this.compressor.threshold.value = -20;
+    this.compressor.knee.value = 10;
+    this.compressor.ratio.value = 3;
     this.compressor.attack.value = 0.001;
     this.compressor.release.value = 0.05;
-
-    console.log('🔊 Audio: Gain x12 + Compresor ratio:8');
 
     await this.audioContext.audioWorklet.addModule(
       URL.createObjectURL(new Blob([`
         class PCMProcessor extends AudioWorkletProcessor {
           constructor() {
             super();
-            this.port.onmessage = (e) => {
-              if (e.data === 'stop') this.port.postMessage('stopped');
-            };
+            // Normalizador adaptativo per-chunk:
+            // Mantiene el nivel promedio de los últimos N chunks para
+            // amplificar voces débiles sin saturar voces fuertes.
+            this._recentPeaks = new Float32Array(8);
+            this._peakIdx = 0;
           }
-          process(inputs, outputs, parameters) {
+
+          process(inputs) {
             const input = inputs[0];
             if (input && input[0]) {
               const inputData = input[0];
+
+              // Calcular peak del chunk actual
+              let peak = 0;
+              for (let i = 0; i < inputData.length; i++) {
+                const abs = Math.abs(inputData[i]);
+                if (abs > peak) peak = abs;
+              }
+
+              // Actualizar ventana de peaks recientes
+              this._recentPeaks[this._peakIdx] = peak;
+              this._peakIdx = (this._peakIdx + 1) % this._recentPeaks.length;
+
+              // Peak máximo de la ventana (últimos ~8 chunks = ~800ms)
+              let windowPeak = 0;
+              for (let i = 0; i < this._recentPeaks.length; i++) {
+                if (this._recentPeaks[i] > windowPeak) windowPeak = this._recentPeaks[i];
+              }
+
+              // Ganancia adaptativa: normalizar al 70% del rango máximo.
+              // Si el audio es muy bajo (peak < 0.001) usar ganancia máxima de 8x.
+              // Si el audio es normal, ganancia = 0.7 / windowPeak (máx 8x, mín 1x).
+              let gain = 1.0;
+              if (windowPeak > 0.001) {
+                gain = Math.min(8.0, Math.max(1.0, 0.7 / windowPeak));
+              } else {
+                gain = 8.0; // silencio total → ganancia máxima para capturar susurros
+              }
+
               const pcm16 = new Int16Array(inputData.length);
               for (let i = 0; i < inputData.length; i++) {
-                const sample = Math.max(-1, Math.min(1, inputData[i]));
-                pcm16[i] = sample < 0 ? sample * 32768 : sample * 32767;
+                const amplified = Math.max(-1, Math.min(1, inputData[i] * gain));
+                pcm16[i] = amplified < 0 ? amplified * 32768 : amplified * 32767;
               }
               this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
             }
@@ -103,9 +129,7 @@ export class AudioService {
     this.gainNode.connect(this.compressor);
     this.compressor.connect(this.processor);
 
-    this.bufferIndex = 0;
     this.chunksReceived = 0;
-    this.lastVoiceTime = Date.now();
 
     this.processor.port.onmessage = (e) => {
       if (!(e.data instanceof ArrayBuffer)) return;
@@ -121,58 +145,49 @@ export class AudioService {
           this.bufferIndex = 0;
           this.chunksReceived++;
 
+          // ── Sin noise gate ─────────────────────────────────────────────
+          // AssemblyAI v3 tiene VAD interno. Filtrar en el cliente causa
+          // pérdida de voz suave (doctor). Enviamos TODO el audio siempre.
+          // AAI decide qué es silencio y qué es voz.
           const audioBuffer = new ArrayBuffer(chunk.byteLength);
           new Int16Array(audioBuffer).set(chunk);
           this.chunkSubject.next(audioBuffer);
 
           if (this.chunksReceived % 20 === 0) {
-            const level = this.calculateAudioLevel(chunk);
-            const now = Date.now();
-            if (level > -40) this.lastVoiceTime = now;
-            const silenceDuration = now - this.lastVoiceTime;
-            console.log(
-              `🎤 Chunk #${this.chunksReceived}: ${level.toFixed(1)}dB` +
-              (silenceDuration > this.SILENCE_LOG_THRESHOLD
-                ? ` | ⚠️ Silencio: ${(silenceDuration / 1000).toFixed(1)}s`
-                : '')
-            );
+            const level = this.calculateRMS(chunk);
+            console.log(`🎤 Chunk #${this.chunksReceived}: ${level.toFixed(1)} dB`);
           }
         }
       }
     };
 
     this.isRecording = true;
-    console.log('✅ Grabación iniciada — audio continuo hacia AssemblyAI');
+    console.log('✅ Grabación iniciada — audio completo hacia AssemblyAI (chunks 100ms)');
   }
 
-  private calculateAudioLevel(buffer: Int16Array): number {
+  private calculateRMS(buffer: Int16Array): number {
     let sum = 0;
-    for (let i = 0; i < buffer.length; i++) sum += Math.abs(buffer[i]);
-    const avg = sum / buffer.length;
-    const normalized = avg / 32768;
-    return 20 * Math.log10(normalized + 0.0001);
+    for (let i = 0; i < buffer.length; i++) {
+      const normalized = buffer[i] / 32768;
+      sum += normalized * normalized;
+    }
+    const rms = Math.sqrt(sum / buffer.length);
+    if (rms === 0) return -100;
+    return 20 * Math.log10(rms);
   }
 
   stopRecording() {
     if (!this.isRecording) return;
     this.isRecording = false;
 
-    if (this.processor) {
-      this.processor.port.postMessage('stop');
-      this.processor.disconnect();
-      this.processor = null;
-    }
-    if (this.source) {
-      this.source.mediaStream.getTracks().forEach(track => track.stop());
-      this.source.disconnect();
-      this.source = null;
-    }
-    if (this.gainNode) { this.gainNode.disconnect(); this.gainNode = null; }
-    if (this.compressor) { this.compressor.disconnect(); this.compressor = null; }
-    if (this.audioContext) { this.audioContext.close(); this.audioContext = null; }
+    if (this.processor)   { this.processor.disconnect(); this.processor = null; }
+    if (this.source)      { this.source.mediaStream.getTracks().forEach(t => t.stop()); this.source.disconnect(); this.source = null; }
+    if (this.gainNode)    { this.gainNode.disconnect(); this.gainNode = null; }
+    if (this.compressor)  { this.compressor.disconnect(); this.compressor = null; }
+    if (this.audioContext){ this.audioContext.close(); this.audioContext = null; }
 
-    this.bufferIndex = 0;
     this.chunksReceived = 0;
+    this.bufferIndex = 0;
     console.log('🛑 Captura detenida');
   }
 }
@@ -191,22 +206,18 @@ export class AudioService {
 //   private processor: AudioWorkletNode | null = null;
 //   private isRecording = false;
 
-//   // Se recrea en cada startTabAudioCapture() — NUNCA se llama .complete()
 //   private chunkSubject = new Subject<ArrayBuffer>();
 //   chunk$ = this.chunkSubject.asObservable();
 
-//   private pcmBuffer = new Int16Array(800); // 50ms a 16kHz
+//   // 1600 samples = 100ms @ 16kHz — tamaño estable para AssemblyAI v3
+//   private pcmBuffer = new Int16Array(1600);
 //   private bufferIndex = 0;
 //   private chunksReceived = 0;
-//   private lastVoiceTime = 0;
-//   private readonly SILENCE_LOG_THRESHOLD = 3000;
 
 //   async startTabAudioCapture() {
-//     // Nuevo Subject en cada grabación — el anterior puede estar "muerto"
 //     this.chunkSubject = new Subject<ArrayBuffer>();
 //     this.chunk$ = this.chunkSubject.asObservable();
 
-//     console.log('Abriendo selector de pestaña...');
 //     let stream: MediaStream;
 
 //     try {
@@ -216,62 +227,86 @@ export class AudioService {
 //           echoCancellation: false,
 //           noiseSuppression: false,
 //           autoGainControl: false,
-//           // @ts-ignore
-//           googEchoCancellation: false,
-//           googAutoGainControl: false,
-//           googNoiseSuppression: false,
-//           googHighpassFilter: false,
 //           sampleRate: 16000,
 //         } as any,
 //       });
-//       console.log('✅ Stream capturado');
+
 //       stream.getVideoTracks().forEach(track => track.enabled = false);
 //     } catch (err: any) {
 //       throw new Error(`Screen capture falló: ${err.name}. Usa Chrome + HTTPS.`);
 //     }
 
 //     if (stream.getAudioTracks().length === 0) {
-//       throw new Error('Stream sin audio tracks — marca "Compartir audio" en el diálogo');
+//       throw new Error('Stream sin audio tracks — marca "Compartir audio"');
 //     }
-
-//     const audioTrack = stream.getAudioTracks()[0];
-//     const settings = audioTrack.getSettings();
-//     console.log(`🎤 Audio track: sampleRate=${settings.sampleRate}, channels=${settings.channelCount}`);
 
 //     this.audioContext = new AudioContext({ sampleRate: 16000 });
 //     this.source = this.audioContext.createMediaStreamSource(stream);
 
-//     // Gain x3 — conservador para no clipear el audio (x50 anterior saturaba el VAD)
+//     // Gain bajo (2) para no saturar antes del compresor.
+//     // La amplificación real se hace en el AudioWorklet con normalización per-chunk.
 //     this.gainNode = this.audioContext.createGain();
-//     this.gainNode.gain.value = 3;
+//     this.gainNode.gain.value = 2;
 
-//     // Compresor conservador — normaliza dinámica sin distorsionar
+//     // Compresor solo como limitador de picos — NO como amplificador.
+//     // threshold alto (-20dB): solo actúa en picos muy fuertes.
+//     // ratio bajo (3): compresión suave sin matar voces débiles.
+//     // release rápido (0.05s): se recupera antes del siguiente hablante.
 //     this.compressor = this.audioContext.createDynamicsCompressor();
-//     this.compressor.threshold.value = -24;
+//     this.compressor.threshold.value = -20;
 //     this.compressor.knee.value = 10;
-//     this.compressor.ratio.value = 4;
-//     this.compressor.attack.value = 0.003;
-//     this.compressor.release.value = 0.1;
-
-//     console.log('🔊 Audio: Gain x3 + Compresor ratio:4');
+//     this.compressor.ratio.value = 3;
+//     this.compressor.attack.value = 0.001;
+//     this.compressor.release.value = 0.05;
 
 //     await this.audioContext.audioWorklet.addModule(
 //       URL.createObjectURL(new Blob([`
 //         class PCMProcessor extends AudioWorkletProcessor {
 //           constructor() {
 //             super();
-//             this.port.onmessage = (e) => {
-//               if (e.data === 'stop') this.port.postMessage('stopped');
-//             };
+//             // Normalizador adaptativo per-chunk:
+//             // Mantiene el nivel promedio de los últimos N chunks para
+//             // amplificar voces débiles sin saturar voces fuertes.
+//             this._recentPeaks = new Float32Array(8);
+//             this._peakIdx = 0;
 //           }
-//           process(inputs, outputs, parameters) {
+
+//           process(inputs) {
 //             const input = inputs[0];
 //             if (input && input[0]) {
 //               const inputData = input[0];
+
+//               // Calcular peak del chunk actual
+//               let peak = 0;
+//               for (let i = 0; i < inputData.length; i++) {
+//                 const abs = Math.abs(inputData[i]);
+//                 if (abs > peak) peak = abs;
+//               }
+
+//               // Actualizar ventana de peaks recientes
+//               this._recentPeaks[this._peakIdx] = peak;
+//               this._peakIdx = (this._peakIdx + 1) % this._recentPeaks.length;
+
+//               // Peak máximo de la ventana (últimos ~8 chunks = ~800ms)
+//               let windowPeak = 0;
+//               for (let i = 0; i < this._recentPeaks.length; i++) {
+//                 if (this._recentPeaks[i] > windowPeak) windowPeak = this._recentPeaks[i];
+//               }
+
+//               // Ganancia adaptativa: normalizar al 70% del rango máximo.
+//               // Si el audio es muy bajo (peak < 0.01) usar ganancia máxima de 12x.
+//               // Si el audio es normal, ganancia = 0.7 / windowPeak (máx 8x, mín 1x).
+//               let gain = 1.0;
+//               if (windowPeak > 0.001) {
+//                 gain = Math.min(8.0, Math.max(1.0, 0.7 / windowPeak));
+//               } else {
+//                 gain = 8.0; // silencio total → ganancia máxima para capturar susurros
+//               }
+
 //               const pcm16 = new Int16Array(inputData.length);
 //               for (let i = 0; i < inputData.length; i++) {
-//                 const sample = Math.max(-1, Math.min(1, inputData[i]));
-//                 pcm16[i] = sample < 0 ? sample * 32768 : sample * 32767;
+//                 const amplified = Math.max(-1, Math.min(1, inputData[i] * gain));
+//                 pcm16[i] = amplified < 0 ? amplified * 32768 : amplified * 32767;
 //               }
 //               this.port.postMessage(pcm16.buffer, [pcm16.buffer]);
 //             }
@@ -290,7 +325,6 @@ export class AudioService {
 
 //     this.bufferIndex = 0;
 //     this.chunksReceived = 0;
-//     this.lastVoiceTime = Date.now();
 
 //     this.processor.port.onmessage = (e) => {
 //       if (!(e.data instanceof ArrayBuffer)) return;
@@ -306,65 +340,49 @@ export class AudioService {
 //           this.bufferIndex = 0;
 //           this.chunksReceived++;
 
-//           // SIEMPRE enviar audio — nunca cortar por silencio en el frontend.
-//           // AssemblyAI tiene su propio VAD. Cortar aquí causa pérdida del inicio de frases.
+//           // ── Sin noise gate ─────────────────────────────────────────────
+//           // AssemblyAI v3 tiene VAD interno. Filtrar en el cliente causa
+//           // pérdida de voz suave (doctor). Enviamos TODO el audio siempre.
+//           // AAI decide qué es silencio y qué es voz.
 //           const audioBuffer = new ArrayBuffer(chunk.byteLength);
 //           new Int16Array(audioBuffer).set(chunk);
 //           this.chunkSubject.next(audioBuffer);
 
-//           // Logging cada 20 chunks (~1 segundo)
 //           if (this.chunksReceived % 20 === 0) {
-//             const level = this.calculateAudioLevel(chunk);
-//             const now = Date.now();
-//             if (level > -50) this.lastVoiceTime = now;
-//             const silenceDuration = now - this.lastVoiceTime;
-//             console.log(
-//               `🎤 Chunk #${this.chunksReceived}: ${level.toFixed(1)}dB` +
-//               (silenceDuration > this.SILENCE_LOG_THRESHOLD
-//                 ? ` | ⚠️ Silencio: ${(silenceDuration / 1000).toFixed(1)}s`
-//                 : '')
-//             );
+//             const level = this.calculateRMS(chunk);
+//             console.log(`🎤 Chunk #${this.chunksReceived}: ${level.toFixed(1)} dB`);
 //           }
 //         }
 //       }
 //     };
 
 //     this.isRecording = true;
-//     console.log('✅ Grabación iniciada — audio continuo hacia AssemblyAI');
+//     console.log('✅ Grabación iniciada — audio completo hacia AssemblyAI (chunks 100ms)');
 //   }
 
-//   private calculateAudioLevel(buffer: Int16Array): number {
+//   private calculateRMS(buffer: Int16Array): number {
 //     let sum = 0;
-//     for (let i = 0; i < buffer.length; i++) sum += Math.abs(buffer[i]);
-//     const avg = sum / buffer.length;
-//     const normalized = avg / 32768;
-//     return 20 * Math.log10(normalized + 0.0001);
+//     for (let i = 0; i < buffer.length; i++) {
+//       const normalized = buffer[i] / 32768;
+//       sum += normalized * normalized;
+//     }
+//     const rms = Math.sqrt(sum / buffer.length);
+//     if (rms === 0) return -100;
+//     return 20 * Math.log10(rms);
 //   }
 
 //   stopRecording() {
 //     if (!this.isRecording) return;
 //     this.isRecording = false;
 
-//     if (this.processor) {
-//       this.processor.port.postMessage('stop');
-//       this.processor.disconnect();
-//       this.processor = null;
-//     }
-//     if (this.source) {
-//       this.source.mediaStream.getTracks().forEach(track => track.stop());
-//       this.source.disconnect();
-//       this.source = null;
-//     }
-//     if (this.gainNode) { this.gainNode.disconnect(); this.gainNode = null; }
-//     if (this.compressor) { this.compressor.disconnect(); this.compressor = null; }
-//     if (this.audioContext) { this.audioContext.close(); this.audioContext = null; }
-
-//     // NO llamar .complete() — causa que chunk$ nunca emita en la siguiente grabación
-//     // El Subject muere silenciosamente cuando se pierde la referencia.
+//     if (this.processor)   { this.processor.disconnect(); this.processor = null; }
+//     if (this.source)      { this.source.mediaStream.getTracks().forEach(t => t.stop()); this.source.disconnect(); this.source = null; }
+//     if (this.gainNode)    { this.gainNode.disconnect(); this.gainNode = null; }
+//     if (this.compressor)  { this.compressor.disconnect(); this.compressor = null; }
+//     if (this.audioContext){ this.audioContext.close(); this.audioContext = null; }
 
 //     this.bufferIndex = 0;
 //     this.chunksReceived = 0;
 //     console.log('🛑 Captura detenida');
 //   }
 // }
-

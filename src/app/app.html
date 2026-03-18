@@ -1,5 +1,5 @@
 <div class="app-container">
-  <!-- Translation Panel (Left Side) - FIJO -->
+  <!-- Translation Panel (Left Side) -->
   <div class="translation-panel">
     <div class="panel-header">
       <h3>🌐 Traducciones</h3>
@@ -39,9 +39,7 @@
     <mat-card class="main-card">
       <mat-card-header>
         <mat-card-title>GetIntercall - Transcripción Real-Time</mat-card-title>
-        <mat-card-subtitle>
-          Detección automática de inglés y español
-        </mat-card-subtitle>
+        <mat-card-subtitle>Detección automática de inglés y español</mat-card-subtitle>
       </mat-card-header>
 
       <mat-card-content>
@@ -58,7 +56,6 @@
             </button>
           </div>
 
-          <!-- Cronómetro -->
           <div class="timer" [class.active]="isRecording">
             <span class="timer-icon">⏱️</span>
             <span class="timer-display">{{ sessionDuration }}</span>
@@ -67,28 +64,38 @@
 
         <mat-progress-spinner *ngIf="loading" mode="indeterminate" diameter="50"></mat-progress-spinner>
 
-        <div class="transcription-container" #scrollMe (scroll)="onContainerScroll($event)" (mouseup)="onTextSelection()">
-          <div *ngFor="let bloque of bloques" 
-               class="bloque definitivo" 
+        <div class="transcription-container" #scrollMe (scroll)="onContainerScroll()" (mouseup)="onTextSelection()">
+
+          <!-- Bloques definitivos — cada uno es un turno cerrado independiente -->
+          <div *ngFor="let bloque of bloques"
+               class="bloque definitivo"
                [attr.data-lang]="bloque.lang">
             <p class="text">{{ bloque.text }}</p>
           </div>
-          
-          <div *ngIf="currentPartial.text.trim()" 
-               class="bloque temporal" 
-               [attr.data-lang]="currentPartial.lang"
-               [ngClass]="{ 'no-pulse': !autoScrollEnabled }">
-            <p class="text">{{ currentPartial.text }}</p>
+
+          <!-- Partial EN — se muestra solo si hay texto activo del doctor -->
+          <div *ngIf="partialEn.text.trim()"
+               class="bloque temporal"
+               data-lang="en">
+            <p class="text">{{ partialEn.text }}</p>
             <small class="status">● En vivo</small>
           </div>
-          
-          <div *ngIf="loading && bloques.length === 0 && !currentPartial.text" class="loading">
+
+          <!-- Partial ES — se muestra solo si hay texto activo del paciente -->
+          <div *ngIf="partialEs.text.trim()"
+               class="bloque temporal"
+               data-lang="es">
+            <p class="text">{{ partialEs.text }}</p>
+            <small class="status">● En vivo</small>
+          </div>
+
+          <div *ngIf="loading && bloques.length === 0 && !partialEn.text && !partialEs.text" class="loading">
             🎧 Escuchando audio de pestaña...
           </div>
-          <div *ngIf="isRecording && bloques.length === 0 && !currentPartial.text && !loading" class="empty">
+          <div *ngIf="isRecording && bloques.length === 0 && !partialEn.text && !partialEs.text && !loading" class="empty">
             Esperando audio para transcribir...
           </div>
-          <div *ngIf="!isRecording && bloques.length === 0 && !currentPartial.text" class="empty">
+          <div *ngIf="!isRecording && bloques.length === 0 && !partialEn.text && !partialEs.text" class="empty">
             Presiona "🎙️ Iniciar" para comenzar la transcripción
           </div>
         </div>
