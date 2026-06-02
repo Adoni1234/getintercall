@@ -1,3 +1,4 @@
+
 import { Injectable } from '@angular/core';
 import { Subject } from 'rxjs';
 
@@ -15,8 +16,11 @@ export class AudioService {
   private chunkSubject = new Subject<ArrayBuffer>();
   chunk$ = this.chunkSubject.asObservable();
 
-  // 1600 samples = 100ms @ 16kHz — tamaño estable para AssemblyAI v3
-  private pcmBuffer = new Int16Array(1600);
+  // FIX #1: 4800 samples = 300ms @ 16kHz
+  // Con 100ms (1600) los chunks eran demasiado pequeños y AAI no tenía
+  // contexto suficiente para detectar el idioma ni las palabras correctamente.
+  // 300ms es el mínimo recomendado para AssemblyAI v3 streaming multilingüe.
+  private pcmBuffer = new Int16Array(4800);
   private bufferIndex = 0;
   private chunksReceived = 0;
 
@@ -49,15 +53,11 @@ export class AudioService {
     this.audioContext = new AudioContext({ sampleRate: 16000 });
     this.source = this.audioContext.createMediaStreamSource(stream);
 
-    // Gain bajo (2) para no saturar antes del compresor.
-    // La amplificación real se hace en el AudioWorklet con normalización per-chunk.
+    // Gain moderado para no saturar antes del compresor.
     this.gainNode = this.audioContext.createGain();
     this.gainNode.gain.value = 2;
 
-    // Compresor solo como limitador de picos — NO como amplificador.
-    // threshold alto (-20dB): solo actúa en picos muy fuertes.
-    // ratio bajo (3): compresión suave sin matar voces débiles.
-    // release rápido (0.05s): se recupera antes del siguiente hablante.
+    // Compresor como limitador de picos.
     this.compressor = this.audioContext.createDynamicsCompressor();
     this.compressor.threshold.value = -20;
     this.compressor.knee.value = 10;
@@ -93,20 +93,20 @@ export class AudioService {
               this._recentPeaks[this._peakIdx] = peak;
               this._peakIdx = (this._peakIdx + 1) % this._recentPeaks.length;
 
-              // Peak máximo de la ventana (últimos ~8 chunks = ~800ms)
+              // Peak máximo de la ventana (últimos ~8 chunks)
               let windowPeak = 0;
               for (let i = 0; i < this._recentPeaks.length; i++) {
                 if (this._recentPeaks[i] > windowPeak) windowPeak = this._recentPeaks[i];
               }
 
-              // Ganancia adaptativa: normalizar al 70% del rango máximo.
-              // Si el audio es muy bajo (peak < 0.001) usar ganancia máxima de 8x.
-              // Si el audio es normal, ganancia = 0.7 / windowPeak (máx 8x, mín 1x).
+              // FIX #2: Ganancia máxima reducida de 8x a 4x para evitar distorsión
+              // que causa que AAI no reconozca fonemas. El techo de 0.65 (antes 0.7)
+              // deja un poco más de headroom antes de saturar.
               let gain = 1.0;
               if (windowPeak > 0.001) {
-                gain = Math.min(8.0, Math.max(1.0, 0.7 / windowPeak));
+                gain = Math.min(4.0, Math.max(1.0, 0.65 / windowPeak));
               } else {
-                gain = 8.0; // silencio total → ganancia máxima para capturar susurros
+                gain = 4.0; // silencio total → ganancia máxima reducida
               }
 
               const pcm16 = new Int16Array(inputData.length);
@@ -145,15 +145,13 @@ export class AudioService {
           this.bufferIndex = 0;
           this.chunksReceived++;
 
-          // ── Sin noise gate ─────────────────────────────────────────────
-          // AssemblyAI v3 tiene VAD interno. Filtrar en el cliente causa
-          // pérdida de voz suave (doctor). Enviamos TODO el audio siempre.
-          // AAI decide qué es silencio y qué es voz.
+          // Sin noise gate — AssemblyAI v3 tiene VAD interno.
           const audioBuffer = new ArrayBuffer(chunk.byteLength);
           new Int16Array(audioBuffer).set(chunk);
           this.chunkSubject.next(audioBuffer);
 
-          if (this.chunksReceived % 20 === 0) {
+          if (this.chunksReceived % 10 === 0) {
+            // Log cada 10 chunks (cada 3s con chunks de 300ms)
             const level = this.calculateRMS(chunk);
             console.log(`🎤 Chunk #${this.chunksReceived}: ${level.toFixed(1)} dB`);
           }
@@ -162,7 +160,7 @@ export class AudioService {
     };
 
     this.isRecording = true;
-    console.log('✅ Grabación iniciada — audio completo hacia AssemblyAI (chunks 100ms)');
+    console.log('✅ Grabación iniciada — chunks 300ms hacia AssemblyAI');
   }
 
   private calculateRMS(buffer: Int16Array): number {
@@ -294,7 +292,7 @@ export class AudioService {
 //               }
 
 //               // Ganancia adaptativa: normalizar al 70% del rango máximo.
-//               // Si el audio es muy bajo (peak < 0.01) usar ganancia máxima de 12x.
+//               // Si el audio es muy bajo (peak < 0.001) usar ganancia máxima de 8x.
 //               // Si el audio es normal, ganancia = 0.7 / windowPeak (máx 8x, mín 1x).
 //               let gain = 1.0;
 //               if (windowPeak > 0.001) {
@@ -323,7 +321,6 @@ export class AudioService {
 //     this.gainNode.connect(this.compressor);
 //     this.compressor.connect(this.processor);
 
-//     this.bufferIndex = 0;
 //     this.chunksReceived = 0;
 
 //     this.processor.port.onmessage = (e) => {
@@ -381,8 +378,8 @@ export class AudioService {
 //     if (this.compressor)  { this.compressor.disconnect(); this.compressor = null; }
 //     if (this.audioContext){ this.audioContext.close(); this.audioContext = null; }
 
-//     this.bufferIndex = 0;
 //     this.chunksReceived = 0;
+//     this.bufferIndex = 0;
 //     console.log('🛑 Captura detenida');
 //   }
 // }
